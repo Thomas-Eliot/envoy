@@ -1,0 +1,382 @@
+syntax = "proto3";
+
+package envoy.service.rate_limit_quota_apig.v3;
+
+import "envoy/extensions/filters/http/rate_limit_quota_apig/v3/rate_limit_quota.proto";
+import "envoy/service/discovery/v3/discovery.proto";
+import "envoy/type/v3/ratelimit_strategy.proto";
+
+import "google/protobuf/duration.proto";
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.service.rate_limit_quota_apig.v3";
+option java_outer_classname = "RlqsApigProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/service/rate_limit_quota_apig/v3;rate_limit_quota_apigv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: Rate Limit Quota Service (RLQS)]
+
+// The Rate Limit Quota Service (RLQS) is a Envoy global rate limiting service that allows to
+// delegate rate limit decisions to a remote service. The service will aggregate the usage reports
+// from multiple data plane instances, and distribute Rate Limit Assignments to each instance
+// based on its business logic. The logic is outside of the scope of the protocol API.
+//
+// The protocol is designed as a streaming-first API. It utilizes watch-like subscription model.
+// The data plane groups requests into Quota Buckets as directed by the filter config,
+// and periodically reports them to the RLQS server along with the Bucket identifier, :ref:`BucketId
+// <envoy_v3_api_msg_service.rate_limit_quota_apig.v3.BucketId>`. Once RLQS server has collected enough
+// reports to make a decision, it'll send back the assignment with the rate limiting instructions.
+//
+// The first report sent by the data plane is interpreted by the RLQS server as a "watch" request,
+// indicating that the data plane instance is interested in receiving further updates for the
+// ``BucketId``. From then on, RLQS server may push assignments to this instance at will, even if
+// the instance is not sending usage reports. It's the responsibility of the RLQS server
+// to determine when the data plane instance didn't send ``BucketId`` reports for too long,
+// and to respond with the :ref:`AbandonAction
+// <envoy_v3_api_msg_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.AbandonAction>`,
+// indicating that the server has now stopped sending quota assignments for the ``BucketId`` bucket,
+// and the data plane instance should :ref:`abandon
+// <envoy_v3_api_field_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.abandon_action>`
+// it.
+//
+// Refer to Rate Limit Quota :ref:`configuration overview <config_http_filters_rate_limit_quota>`
+// for further details.
+
+// Defines the Rate Limit Quota Service (RLQS).
+service RateLimitQuotaService {
+  // Main communication channel: the data plane sends usage reports to the RLQS server,
+  // and the server asynchronously responding with the assignments.
+  rpc StreamRateLimitQuotas(stream RateLimitQuotaUsageReports)
+      returns (stream RateLimitQuotaResponse) {
+  }
+}
+
+// Defines the Rate Limit Quota Config Discovery Service (RLQS Conf DS).
+//
+// Used by the filter to subscribe to per-(tenant, scope) ``BucketSettings``
+// resources, which the server compiles dynamically out of the control-plane
+// store (Tair). Resources carry per-dimension ``deny_response_settings`` and
+// a ``bucket_id_builder._dim`` tag so the filter can fan out a matched route
+// into one independent ``BucketId`` per dimension (T-EC-08 spec § D-7 / D-8).
+//
+// Wire protocol is xDS-flavored (``DiscoveryRequest`` / ``DiscoveryResponse``):
+//   - filter sends one resource name per (tenant, scope) it has seen at
+//     request time, formatted as ``"{tenant}|{scope_type}:{scope_value}"``
+//     (e.g. ``"t1|route:chat-api"``);
+//   - server replies with zero or more ``RateLimitQuotaBucketSettings``
+//     resources (one per configured dimension), or omits the resource to
+//     signal "no config → filter walks no_assignment_behavior fallback"
+//     (spec § D-6 AbandonAction equivalent);
+//   - server also pushes unsolicited responses when Tair Pub/Sub fires
+//     invalidation for a subscribed resource.
+service RateLimitQuotaConfigDiscoveryService {
+  // Bidirectional stream: the filter sends subscriptions, the server pushes
+  // resource updates as Tair changes. Long-lived; reconnect with backoff
+  // on transport failures.
+  rpc StreamRlQsConfigs(stream envoy.service.discovery.v3.DiscoveryRequest)
+      returns (stream envoy.service.discovery.v3.DiscoveryResponse) {
+  }
+
+  // Unary alternative for environments where bidirectional streaming is
+  // unavailable. The filter must poll periodically to pick up server-side
+  // changes.
+  rpc FetchRlQsConfigs(envoy.service.discovery.v3.DiscoveryRequest)
+      returns (envoy.service.discovery.v3.DiscoveryResponse) {
+  }
+
+  // Get a single quota config based on tenant and scope.
+  // Used by the filter to fetch config on-demand without subscribing to xDS.
+  rpc GetQuotaConfig(GetQuotaConfigRequest)
+      returns (GetQuotaConfigResponse) {
+  }
+}
+
+message GetQuotaConfigRequest {
+  string tenant = 1;
+  string scope = 2;
+}
+
+message GetQuotaConfigResponse {
+  repeated envoy.extensions.filters.http.rate_limit_quota_apig.v3.RateLimitQuotaBucketSettings settings = 1;
+}
+
+message RateLimitQuotaUsageReports {
+  // The usage report for a bucket.
+  //
+  // .. note::
+  //   Note that the first report sent for a ``BucketId`` indicates to the RLQS server that
+  //   the RLQS client is subscribing for the future assignments for this ``BucketId``.
+  message BucketQuotaUsage {
+    // ``BucketId`` for which request quota usage is reported.
+    BucketId bucket_id = 1 [(validate.rules).message = {required: true}];
+
+    // Time elapsed since the last report.
+    google.protobuf.Duration time_elapsed = 2 [(validate.rules).duration = {
+      required: true
+      gt {}
+    }];
+
+    // Requests the data plane has allowed through.
+    uint64 num_requests_allowed = 3;
+
+    // Requests throttled.
+    uint64 num_requests_denied = 4;
+
+    // Tokens consumed during this reporting interval.
+    // Populated by the data plane when the LLM response contains token usage.
+    uint64 tokens_consumed = 5;
+
+    // Current number of active requests in this bucket.
+    // Used for concurrency limiting (In-flight requests).
+    uint64 active_requests = 6;
+
+    // Input tokens consumed.
+    uint64 input_tokens_consumed = 7;
+
+    // Output tokens consumed.
+    uint64 output_tokens_consumed = 8;
+
+    // Cached tokens consumed.
+    uint64 cached_tokens_consumed = 9;
+  }
+
+  // All quota requests must specify the domain. This enables sharing the quota
+  // server between different applications without fear of overlap.
+  // E.g., "envoy".
+  //
+  // Should only be provided in the first report, all subsequent messages on the same
+  // stream are considered to be in the same domain. In case the domain needs to be
+  // changed, close the stream, and reopen a new one with the different domain.
+  string domain = 1 [(validate.rules).string = {min_len: 1}];
+
+  // A list of quota usage reports. The list is processed by the RLQS server in the same order
+  // it's provided by the client.
+  repeated BucketQuotaUsage bucket_quota_usages = 2 [(validate.rules).repeated = {min_items: 1}];
+}
+
+message RateLimitQuotaResponse {
+  // Commands the data plane to apply one of the actions to the bucket with the
+  // :ref:`bucket_id <envoy_v3_api_field_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.bucket_id>`.
+  message BucketAction {
+    // Quota assignment for the bucket. Configures the rate limiting strategy and the duration
+    // for the given :ref:`bucket_id
+    // <envoy_v3_api_field_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.bucket_id>`.
+    //
+    // **Applying the first assignment to the bucket**
+    //
+    // Once the data plane receives the ``QuotaAssignmentAction``, it must send the current usage
+    // report for the bucket, and start rate limiting requests matched into the bucket
+    // using the strategy configured in the :ref:`rate_limit_strategy
+    // <envoy_v3_api_field_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.QuotaAssignmentAction.rate_limit_strategy>`
+    // field. The assignment becomes bucket's ``active`` assignment.
+    //
+    // **Expiring the assignment**
+    //
+    // The duration of the assignment defined in the :ref:`assignment_time_to_live
+    // <envoy_v3_api_field_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.QuotaAssignmentAction.assignment_time_to_live>`
+    // field. When the duration runs off, the assignment is ``expired``, and no longer ``active``.
+    // The data plane should stop applying the rate limiting strategy to the bucket, and transition
+    // the bucket to the "expired assignment" state. This activates the behavior configured in the
+    // :ref:`expired_assignment_behavior <envoy_v3_api_field_extensions.filters.http.rate_limit_quota_apig.v3.RateLimitQuotaBucketSettings.expired_assignment_behavior>`
+    // field.
+    //
+    // **Replacing the assignment**
+    //
+    // * If the rate limiting strategy is different from bucket's ``active`` assignment, or
+    //   the current bucket assignment is ``expired``, the data plane must immediately
+    //   end the current assignment, report the bucket usage, and apply the new assignment.
+    //   The new assignment becomes bucket's ``active`` assignment.
+    // * If the rate limiting strategy is the same as the bucket's ``active`` (not ``expired``)
+    //   assignment, the data plane should extend the duration of the ``active`` assignment
+    //   for the duration of the new assignment provided in the :ref:`assignment_time_to_live
+    //   <envoy_v3_api_field_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.QuotaAssignmentAction.assignment_time_to_live>`
+    //   field. The ``active`` assignment is considered unchanged.
+    message QuotaAssignmentAction {
+      // A duration after which the assignment is be considered ``expired``. The process of the
+      // expiration is described :ref:`above
+      // <envoy_v3_api_msg_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.QuotaAssignmentAction>`.
+      //
+      // * If unset, the assignment has no expiration date.
+      // * If set to ``0``, the assignment expires immediately, forcing the client into the
+      //   :ref:`"expired assignment"
+      //   <envoy_v3_api_field_extensions.filters.http.rate_limit_quota_apig.v3.RateLimitQuotaBucketSettings.ExpiredAssignmentBehavior.expired_assignment_behavior_timeout>`
+      //   state. This may be used by the RLQS server in cases when it needs clients to proactively
+      //   fall back to the pre-configured :ref:`ExpiredAssignmentBehavior
+      //   <envoy_v3_api_msg_extensions.filters.http.rate_limit_quota_apig.v3.RateLimitQuotaBucketSettings.ExpiredAssignmentBehavior>`,
+      //   f.e. before the server going into restart.
+      //
+      // .. attention::
+      //   Note that :ref:`expiring
+      //   <envoy_v3_api_msg_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.QuotaAssignmentAction>`
+      //   the assignment is not the same as :ref:`abandoning
+      //   <envoy_v3_api_msg_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.AbandonAction>`
+      //   the assignment. While expiring the assignment just transitions the bucket to
+      //   the "expired assignment" state; abandoning the assignment completely erases
+      //   the bucket from the data plane memory, and stops the usage reports.
+      google.protobuf.Duration assignment_time_to_live = 2 [(validate.rules).duration = {gte {}}];
+
+      // Configures the local rate limiter for the request matched to the bucket.
+      // If not set, allow all requests.
+      type.v3.RateLimitStrategy rate_limit_strategy = 3;
+
+      // Degradation mode information for the bucket.
+      // When enabled, the data plane should switch to synchronous rate limiting
+      // to ensure accuracy when global tokens are scarce.
+      DegradationInfo degradation_info = 4;
+
+      message ConcurrencyLimit {
+        uint64 limit = 1;
+      }
+
+      // The concurrency limit assigned to this bucket.
+      // When set, the data plane applies an active in-flight request limit
+      // instead of the token_bucket rate limit strategy.
+      ConcurrencyLimit concurrency_limit = 5;
+    }
+
+    // Degradation information for the bucket assignment.
+    // Used to signal the data plane to switch to synchronous rate limiting mode
+    // when global remaining tokens are below the threshold.
+    message DegradationInfo {
+      // If true, the data plane should switch to synchronous rate limiting mode.
+      // In this mode, each request should query the quota server synchronously
+      // instead of using local token bucket.
+      bool degraded = 1;
+
+      // Global remaining tokens across all nodes. For informational purposes.
+      uint64 global_remaining_tokens = 2;
+
+      // The threshold below which degradation mode is enabled.
+      // This is typically: node_count * sync_latency_reserve_tokens
+      uint64 degradation_threshold = 3;
+
+      // If true, the data plane MUST enforce 100%-accurate rate limiting for this
+      // bucket. Set only on the request dimension. When combined with
+      // ``degraded == true``, the filter is required to drop its local token
+      // bucket and route every subsequent request through synchronous
+      // SyncCheck. When the SyncCheck path returns DENY (or fails), the filter
+      // MUST cache that decision locally for ``deny_retry_after_ms`` to avoid a
+      // SyncCheck thundering herd.
+      bool strict_request_mode = 4;
+
+      // Local deny-cache TTL hint for the data plane, in milliseconds. Set by
+      // the control plane on SyncCheck DENY (or alloc-time degradation) to
+      // bound the time the filter rejects requests without re-querying the
+      // server. The filter MUST honor an upper bound of the current quota
+      // window's remaining time. A value of 0 means no hint - the filter
+      // chooses its own default. Only meaningful when
+      // ``strict_request_mode == true``.
+      uint32 deny_retry_after_ms = 5;
+    }
+
+    // Abandon action for the bucket. Indicates that the RLQS server will no longer be
+    // sending updates for the given :ref:`bucket_id
+    // <envoy_v3_api_field_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.bucket_id>`.
+    //
+    // If no requests are reported for a bucket, after some time the server considers the bucket
+    // inactive. The server stops tracking the bucket, and instructs the data plane to abandon
+    // the bucket via this message.
+    //
+    // **Abandoning the assignment**
+    //
+    // The data plane is to erase the bucket (including its usage data) from the memory.
+    // It should stop tracking the bucket, and stop reporting its usage. This effectively resets
+    // the data plane to the state prior to matching the first request into the bucket.
+    //
+    // **Restarting the subscription**
+    //
+    // If a new request is matched into a bucket previously abandoned, the data plane must behave
+    // as if it has never tracked the bucket, and it's the first request matched into it:
+    //
+    // 1. The process of :ref:`subscription and reporting
+    //    <envoy_v3_api_field_extensions.filters.http.rate_limit_quota_apig.v3.RateLimitQuotaBucketSettings.reporting_interval>`
+    //    starts from the beginning.
+    //
+    // 2. The bucket transitions to the :ref:`"no assignment"
+    //    <envoy_v3_api_field_extensions.filters.http.rate_limit_quota_apig.v3.RateLimitQuotaBucketSettings.no_assignment_behavior>`
+    //    state.
+    //
+    // 3. Once the new assignment is received, it's applied per
+    //    "Applying the first assignment to the bucket" section of the :ref:`QuotaAssignmentAction
+    //    <envoy_v3_api_msg_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.QuotaAssignmentAction>`.
+    message AbandonAction {
+    }
+
+    // ``BucketId`` for which request the action is applied.
+    BucketId bucket_id = 1 [(validate.rules).message = {required: true}];
+
+    oneof bucket_action {
+      option (validate.required) = true;
+
+      // Apply the quota assignment to the bucket.
+      //
+      // Commands the data plane to apply a rate limiting strategy to the bucket.
+      // The process of applying and expiring the rate limiting strategy is detailed in the
+      // :ref:`QuotaAssignmentAction
+      // <envoy_v3_api_msg_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.QuotaAssignmentAction>`
+      // message.
+      QuotaAssignmentAction quota_assignment_action = 2;
+
+      // Abandon the bucket.
+      //
+      // Commands the data plane to abandon the bucket.
+      // The process of abandoning the bucket is described in the :ref:`AbandonAction
+      // <envoy_v3_api_msg_service.rate_limit_quota_apig.v3.RateLimitQuotaResponse.BucketAction.AbandonAction>`
+      // message.
+      AbandonAction abandon_action = 3;
+    }
+
+    // T-EC-08 D-2/D-7: per-action ``BucketSettings`` override. When the
+    // server enforces a multi-dimension route (QPS + concurrency on the
+    // same bucket_id), it sets this field to the BucketSettings of the
+    // dimension that triggered the deny. The filter merges these settings
+    // over its cached BucketSettings for this bucket_id BEFORE applying
+    // the assignment, so the deny_response_settings reflect the actually
+    // triggered dimension instead of the bucket_id's primary cache entry.
+    //
+    // Backwards compatibility: this field is optional. When unset, the
+    // filter uses its previously-cached BucketSettings (single-dim
+    // behaviour). When set, only the populated sub-fields override; the
+    // rest of the cached BucketSettings is preserved (e.g. the filter
+    // keeps its bucket_id_builder and reporting_interval).
+    envoy.extensions.filters.http.rate_limit_quota_apig.v3.RateLimitQuotaBucketSettings bucket_settings = 4;
+  }
+
+  // An ordered list of actions to be applied to the buckets. The actions are applied in the
+  // given order, from top to bottom.
+  repeated BucketAction bucket_action = 1 [(validate.rules).repeated = {min_items: 1}];
+}
+
+// The identifier for the bucket. Used to match the bucket between the control plane (RLQS server),
+// and the data plane (RLQS client), f.e.:
+//
+// * the data plane sends a usage report for requests matched into the bucket with ``BucketId``
+//   to the control plane
+// * the control plane sends an assignment for the bucket with ``BucketId`` to the data plane
+//   Bucket ID.
+//
+// Example:
+//
+// .. validated-code-block:: yaml
+//   :type-name: envoy.service.rate_limit_quota_apig.v3.BucketId
+//
+//   bucket:
+//     name: my_bucket
+//     env: staging
+//
+// .. note::
+//   The order of ``BucketId`` keys do not matter. Buckets ``{ a: 'A', b: 'B' }`` and
+//   ``{ b: 'B', a: 'A' }`` are identical.
+message BucketId {
+  map<string, string> bucket = 1 [(validate.rules).map = {
+    min_pairs: 1
+    keys {string {min_len: 1}}
+    values {string {min_len: 1}}
+  }];
+}
