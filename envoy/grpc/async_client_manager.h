@@ -4,6 +4,8 @@
 #include "envoy/grpc/async_client.h"
 #include "envoy/stats/scope.h"
 
+#include "source/common/protobuf/utility.h"
+
 namespace Envoy {
 namespace Grpc {
 
@@ -32,6 +34,34 @@ private:
 
 using AsyncClientFactoryPtr = std::unique_ptr<AsyncClientFactory>;
 
+class GrpcServiceConfigWithHashKey {
+public:
+  GrpcServiceConfigWithHashKey() = default;
+
+  explicit GrpcServiceConfigWithHashKey(const envoy::config::core::v3::GrpcService& config)
+      : config_(config), pre_computed_hash_(Envoy::MessageUtil::hash(config)) {};
+
+  template <typename H> friend H AbslHashValue(H h, const GrpcServiceConfigWithHashKey& wrapper) {
+    return H::combine(std::move(h), wrapper.pre_computed_hash_);
+  }
+
+  std::size_t getPreComputedHash() const { return pre_computed_hash_; }
+
+  friend bool operator==(const GrpcServiceConfigWithHashKey& lhs,
+                         const GrpcServiceConfigWithHashKey& rhs) {
+    if (lhs.pre_computed_hash_ == rhs.pre_computed_hash_) {
+      return Protobuf::util::MessageDifferencer::Equivalent(lhs.config_, rhs.config_);
+    }
+    return false;
+  }
+
+  const envoy::config::core::v3::GrpcService& config() const { return config_; }
+
+private:
+  envoy::config::core::v3::GrpcService config_;
+  std::size_t pre_computed_hash_;
+};
+
 // Singleton gRPC client manager. Grpc::AsyncClientManager can be used to create per-service
 // Grpc::AsyncClientFactory instances. All manufactured Grpc::AsyncClients must
 // be destroyed before the AsyncClientManager can be safely destructed.
@@ -53,6 +83,16 @@ public:
   virtual RawAsyncClientSharedPtr
   getOrCreateRawAsyncClient(const envoy::config::core::v3::GrpcService& grpc_service,
                             Stats::Scope& scope, bool skip_cluster_check) PURE;
+
+  /**
+   * Create a Grpc::RawAsyncClient with pre-computed hash key for efficient caching.
+   * Delegates to getOrCreateRawAsyncClient using the wrapped GrpcService config.
+   */
+  virtual RawAsyncClientSharedPtr
+  getOrCreateRawAsyncClientWithHashKey(const GrpcServiceConfigWithHashKey& config_with_hash_key,
+                                       Stats::Scope& scope, bool skip_cluster_check) {
+    return getOrCreateRawAsyncClient(config_with_hash_key.config(), scope, skip_cluster_check);
+  }
 
   /**
    * Create a Grpc::AsyncClients factory for a service. Validation of the service is performed and
