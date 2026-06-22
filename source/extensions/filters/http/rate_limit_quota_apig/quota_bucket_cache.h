@@ -69,6 +69,21 @@ inline size_t hashBucketId(const ::envoy::service::rate_limit_quota_apig::v3::Bu
 }
 
 using ::envoy::service::rate_limit_quota_apig::v3::BucketId;
+
+// True when the BucketId carries multi-tenant routing keys (_tenant, _scope)
+// but no per-dimension `_dim` overlay. In dynamic multi-dim mode these base
+// buckets must never be created or heartbeated — only variant buckets
+// (with `_dim`) participate in quota enforcement.
+inline bool isMultiDimGhostBaseBucket(const BucketId& bucket_id) {
+  const auto& m = bucket_id.bucket();
+  if (m.find("_dim") != m.end()) {
+    return false;
+  }
+  const auto tenant_it = m.find("_tenant");
+  const auto scope_it = m.find("_scope");
+  return tenant_it != m.end() && !tenant_it->second.empty() && scope_it != m.end() &&
+         !scope_it->second.empty();
+}
 using ::envoy::service::rate_limit_quota_apig::v3::RateLimitQuotaUsageReports;
 
 using BucketAction = ::envoy::service::rate_limit_quota_apig::v3::RateLimitQuotaResponse::BucketAction;
@@ -118,10 +133,11 @@ struct QuotaUsage {
 // hot-path read of `degradation_threshold` would silently introduce UB.
 // Same lens that surfaced the Round 8 token_bucket_limiter race.
 struct DegradationState {
-  DegradationState() : degraded(false), global_remaining_tokens(0), degradation_threshold(0) {}
+  DegradationState() : degraded(false), global_remaining_tokens(0), degradation_threshold(0),
+                       strict_request_mode(false) {}
   DegradationState(bool degraded, uint64_t global_remaining, uint64_t threshold)
       : degraded(degraded), global_remaining_tokens(global_remaining),
-        degradation_threshold(threshold) {}
+        degradation_threshold(threshold), strict_request_mode(false) {}
 
   // Whether the bucket is currently in degraded mode
   std::atomic<bool> degraded;
@@ -130,6 +146,11 @@ struct DegradationState {
   // Threshold below which degradation is triggered. Atomic for parity with
   // the other two fields and to keep the worker-readable contract uniform.
   std::atomic<uint64_t> degradation_threshold;
+  // Strict request-mode flag. Lives here (not on CachedBucket) because
+  // DegradationState is shared across old/new bucket objects via shared_ptr,
+  // while CachedBucket is replaced on every Phase 1 response — worker threads
+  // holding a stale CachedBucket pointer would miss updates to a per-bucket field.
+  std::atomic<bool> strict_request_mode;
 };
 
 // This object stores the data for single bucket entry. The usage cache & action
@@ -191,15 +212,6 @@ struct CachedBucket {
   // When degraded, the filter should use synchronous quota checks.
   std::shared_ptr<DegradationState> degradation_state;
 
-  // Strict request-mode coordination state, set when the server's
-  // DegradationInfo.strict_request_mode == true (only emitted on the
-  // QuotaDimension == "request" path).
-  //
-  // strict_request_mode mirrors the server flag — it gates the new behavior
-  // (DEGRADED → token_bucket reset, RPC error → fail-closed, heartbeat
-  // self-quarantine). For token / concurrency buckets it stays false and
-  // the filter keeps its existing behavior intact.
-  //
   // deny_until_ns is the wall-clock (monotonic) instant until which any
   // request hitting this bucket is rejected locally without consulting the
   // server. Populated either by a SyncCheck DENY response (via the
@@ -215,10 +227,13 @@ struct CachedBucket {
   // deny cache so the data path fails closed instead of silently
   // double-spending an outdated allocation.
   //
-  // All three are atomic so the worker hot path can read them lock-free
+  // Both are atomic so the worker hot path can read them lock-free
   // (memory_order_relaxed is sufficient: any over-rejection caused by a
   // stale read is the safe direction).
-  std::atomic<bool> strict_request_mode{false};
+  //
+  // NOTE: strict_request_mode lives on DegradationState (shared_ptr),
+  // not here, because CachedBucket is replaced on every Phase 1 response
+  // and worker threads holding a stale pointer would miss updates.
   std::atomic<int64_t> deny_until_ns{0};
   std::atomic<int64_t> last_ack_ns{0};
 };
@@ -238,6 +253,10 @@ public:
                             std::chrono::milliseconds fallback_ttl, bool initial_request_allowed,
                             const DenyResponseSettings& deny_response_settings) PURE;
   virtual std::shared_ptr<CachedBucket> getBucket(size_t id) PURE;
+
+  // Remove a cached bucket by hash. Used to evict ghost multi-dim base buckets
+  // that were created before the dynamic warm-up path completed.
+  virtual void removeBucket(size_t id) PURE;
 
   // Report quota usage for a bucket immediately (used for cold path)
   virtual void reportQuotaUsage(const BucketId& bucket_id, const QuotaUsage& usage) PURE;

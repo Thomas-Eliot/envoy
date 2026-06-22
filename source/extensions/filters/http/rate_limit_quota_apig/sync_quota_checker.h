@@ -40,8 +40,10 @@ public:
   /**
    * Called when the quota check completes.
    * @param allowed Whether the request should be allowed.
+   * @param deny_retry_after_ms Server-provided deny-cache TTL in milliseconds.
+   *        0 means no caching (every request goes through SyncCheck).
    */
-  virtual void onQuotaCheckComplete(bool allowed) PURE;
+  virtual void onQuotaCheckComplete(bool allowed, uint32_t deny_retry_after_ms = 0) PURE;
 
   /**
    * Called when the quota check fails (timeout, network error, etc).
@@ -163,7 +165,7 @@ public:
    * @param max_concurrent_checks Max concurrent active quota checks (circuit breaker).
    */
   GrpcStreamSyncQuotaChecker(Grpc::RawAsyncClientSharedPtr async_client, const std::string& domain,
-                             Event::Dispatcher& dispatcher, bool fallback_allow_on_error = false,
+                             Event::Dispatcher& dispatcher, bool fallback_allow_on_error = true,
                              uint32_t max_concurrent_checks = 100)
       : async_client_(async_client), domain_(domain), dispatcher_(dispatcher),
         fallback_allow_on_error_(fallback_allow_on_error),
@@ -279,6 +281,8 @@ public:
     // Determine if request should be allowed
     bool allowed = fallback_allow_on_error_;
 
+    uint32_t deny_retry_after_ms = 0;
+
     if (response.bucket_action_size() > 0) {
       const auto& action = response.bucket_action(0);
       if (action.has_quota_assignment_action()) {
@@ -297,11 +301,14 @@ public:
           allowed = true;
           ENVOY_LOG(debug, "Async quota check response: no strategy, allowing");
         }
+        if (assignment.has_degradation_info()) {
+          deny_retry_after_ms = assignment.degradation_info().deny_retry_after_ms();
+        }
       }
     }
 
     // Complete the first pending check
-    completeFrontCheck(allowed, false);
+    completeFrontCheck(allowed, false, deny_retry_after_ms);
 
     return true;
   }
@@ -323,8 +330,9 @@ private:
    * Complete the front-most pending check in the queue.
    * @param allowed Whether the request should be allowed (ignored if is_error is true).
    * @param is_error Whether this completion is due to an error.
+   * @param deny_retry_after_ms Server-provided deny-cache TTL (0 = no caching).
    */
-  void completeFrontCheck(bool allowed, bool is_error) {
+  void completeFrontCheck(bool allowed, bool is_error, uint32_t deny_retry_after_ms = 0) {
     // Skip already completed/cancelled entries
     while (!pending_checks_.empty() && pending_checks_.front()->completed) {
       pending_checks_.pop_front();
@@ -358,7 +366,7 @@ private:
       } else {
         ENVOY_LOG(debug, "SyncQuotaChecker: check complete allowed={} rtt_ms={} queue_remaining={}",
                   allowed ? "true" : "false", rtt_ms, pending_checks_.size() - 1);
-        pending->callbacks->onQuotaCheckComplete(allowed);
+        pending->callbacks->onQuotaCheckComplete(allowed, deny_retry_after_ms);
       }
     }
 

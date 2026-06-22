@@ -208,6 +208,33 @@ message RateLimitQuotaFilterConfig {
   // services so token consumption reported to RLQS reflects the aggregated
   // multi-model cost.
   bool extract_agent_token_usage = 108;
+
+  // Filter-level timeout for on-demand config discovery fetch. When the
+  // filter suspends a request to fetch per-(tenant, scope) quota config
+  // from ``rlqs_config_server``, this timeout ensures the request is
+  // resumed even if the gRPC callback chain breaks (e.g. server
+  // unreachable, listener drain). On timeout the filter falls back to
+  // single-dimension bucket processing with the static ``bucket_matchers``
+  // config. Only effective when ``rlqs_config_server`` is set.
+  // If unset, defaults to 2 seconds.
+  google.protobuf.Duration config_fetch_timeout = 109;
+
+  // TTL for caching failed config fetch results. When a GetQuotaConfig RPC
+  // fails or times out, subsequent requests for the same (tenant, scope) will
+  // skip the fetch and immediately fall back to single-dimension bucket
+  // processing for this duration. This prevents every request from waiting for
+  // the full ``config_fetch_timeout`` when the RLQS config server is
+  // unavailable. Only effective when ``rlqs_config_server`` is set.
+  // If unset, defaults to 30 seconds.
+  google.protobuf.Duration config_fetch_negative_cache_ttl = 110;
+
+  // Idle eviction TTL for dynamically fetched configs. When a (tenant, scope)
+  // config has not been accessed by any request for this duration, it is evicted
+  // from the in-memory DynamicSettingsRegistry. The next request for the evicted
+  // (tenant, scope) triggers a fresh GetQuotaConfig RPC. Set to 0 to disable.
+  // Only effective when ``rlqs_config_server`` is set.
+  // If unset, defaults to 20 seconds.
+  google.protobuf.Duration config_idle_eviction_ttl = 111;
 }
 
 // Configures the dynamic extraction of tenant and scope keys.
@@ -242,15 +269,14 @@ message TenantKeySource {
     // The key to use in the BucketId map. If empty, defaults to "_scope".
     string bucket_key = 4;
     // Only applies when ``type`` is ``ROUTE_NAME``. Default ``false`` — the
-    // extracted route name is MD5-hashed (lower-case hex, 32 chars) before being
-    // joined with ``prefix`` and written to the BucketId map. The hash bounds
-    // the size of the downstream Redis key family on the rate-limit service
-    // side, so user-defined route names of arbitrary length cannot push keys
-    // past their practical length limit. Set to ``true`` to preserve the
-    // literal route name end-to-end. Has no effect on other ``ScopeType``
-    // values (VIRTUAL_HOST_NAME / CLUSTER_NAME / GLOBAL / REQUEST_HEADER are
-    // always literal).
-    bool disable_route_name_hash = 5;
+    // extracted route name is used as a literal string in the BucketId map,
+    // consistent with other ``ScopeType`` values. Set to ``true`` to
+    // MD5-hash the route name (lower-case hex, 32 chars) before joining
+    // with ``prefix``; this bounds the size of the downstream Redis key
+    // family when user-defined route names can be arbitrarily long. Has no
+    // effect on other ``ScopeType`` values (VIRTUAL_HOST_NAME /
+    // CLUSTER_NAME / GLOBAL / REQUEST_HEADER are always literal).
+    bool enable_route_name_hash = 5;
   }
   TenantConfig tenant = 1;
   ScopeConfig scope = 2;
@@ -278,14 +304,14 @@ message ColdHotSplitConfig {
   // and the number of cold-path frequency slots). If 0 or unset, 10000 is used.
   uint64 max_tracked_buckets = 4;
 
-  // Timeout for cold-path sync quota check. If unset, ``cold`` uses 20ms, then
-  // :ref:`degradation_mode_config.sync_check_timeout` if set.
+  // Timeout for cold-path sync quota check. If unset, defaults to 100ms, or
+  // :ref:`degradation_mode_config.sync_check_timeout` when that is set.
   google.protobuf.Duration cold_sync_timeout = 5;
 
-  // If true, on cold-path check failure/timeout, allow the request. If false, deny. When
-  // :ref:`RateLimitQuotaFilterConfig.cold_hot_config` is not set, cold path falls back to
-  // :ref:`degradation_mode_config` for timeout and fallback.
-  bool cold_fallback_allow_on_error = 6;
+  // If true, on cold-path check failure/timeout, allow the request. If false, deny.
+  // Default: true (fail-open). When :ref:`RateLimitQuotaFilterConfig.cold_hot_config` is not
+  // set, cold path falls back to :ref:`degradation_mode_config` for timeout and fallback.
+  google.protobuf.BoolValue cold_fallback_allow_on_error = 6;
 
   // If the long-tail (cold) path is selected but a :ref:`SyncQuotaChecker` cannot be created
   // (e.g. ``rlqs_server`` not configured in tests), this controls behavior.
@@ -324,8 +350,8 @@ message DegradationModeConfig {
 
   // Behavior when synchronous check times out.
   // If true, allow the request (fail-open). If false, deny the request (fail-close).
-  // Default: true (fail-open)
-  bool fallback_allow_on_timeout = 3;
+  // Default: true (fail-open).
+  google.protobuf.BoolValue fallback_allow_on_timeout = 3;
 }
 
 // Per-route and per-host configuration overrides. The more specific definition completely

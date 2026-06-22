@@ -82,7 +82,7 @@ GlobalRateLimitClientImpl::GlobalRateLimitClientImpl(
     Envoy::ThreadLocal::TypedSlot<ThreadLocalBucketsCache>& buckets_tls,
     Envoy::Event::Dispatcher& main_dispatcher, bool enable_global_hotspot,
     size_t max_tracked_bucket_hashes, std::chrono::milliseconds hotspot_frequency_window,
-    size_t max_bucket_cache_entries)
+    size_t max_bucket_cache_entries, bool suppress_multi_dim_ghost_base_buckets)
     : domain_name_(domain_name), async_client_(context.getServerFactoryContext()
                                                   .clusterManager()
                                                   .grpcAsyncClientManager()
@@ -93,7 +93,8 @@ GlobalRateLimitClientImpl::GlobalRateLimitClientImpl(
       send_reports_interval_(send_reports_interval),
       time_source_(context.getServerFactoryContext().mainThreadDispatcher().timeSource()),
       main_dispatcher_(main_dispatcher),
-      max_bucket_cache_entries_(max_bucket_cache_entries) {
+      max_bucket_cache_entries_(max_bucket_cache_entries),
+      suppress_multi_dim_ghost_base_buckets_(suppress_multi_dim_ghost_base_buckets) {
   if (enable_global_hotspot) {
     hotspot_tracker_ = std::make_shared<GlobalHotspotTracker>(
         main_dispatcher_, context.getServerFactoryContext().threadLocal(),
@@ -341,6 +342,11 @@ RateLimitQuotaUsageReports GlobalRateLimitClientImpl::buildReports() {
     std::vector<uint64_t> keys_to_evict;
 
     for (auto& [key, cached] : shard) {
+      if (suppress_multi_dim_ghost_base_buckets_ &&
+          isMultiDimGhostBaseBucket(cached->bucket_id)) {
+        continue;
+      }
+
       std::shared_ptr<QuotaUsage> cached_usage = cached->quota_usage;
 
       // Strict-request heartbeat self-quarantine (INV-9). When the global
@@ -352,7 +358,8 @@ RateLimitQuotaUsageReports GlobalRateLimitClientImpl::buildReports() {
       // RPC stampede until the next successful response refreshes
       // last_ack_ns. Token / concurrency buckets skip this check (they
       // never set strict_request_mode).
-      if (cached->strict_request_mode.load(std::memory_order_relaxed)) {
+      if (cached->degradation_state &&
+          cached->degradation_state->strict_request_mode.load(std::memory_order_relaxed)) {
         const int64_t now_ns = now.count();
         const int64_t last_ack_ns = cached->last_ack_ns.load(std::memory_order_relaxed);
         if (last_ack_ns > 0) {
@@ -401,9 +408,6 @@ RateLimitQuotaUsageReports GlobalRateLimitClientImpl::buildReports() {
                 /*token_bucket_limiter=*/nullptr,
                 /*response_settings=*/cached->response_settings,
                 /*degradation_state=*/cached->degradation_state);
-            new_bucket->strict_request_mode.store(
-                cached->strict_request_mode.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
             new_bucket->last_ack_ns.store(
                 cached->last_ack_ns.load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
@@ -485,7 +489,6 @@ RateLimitQuotaUsageReports GlobalRateLimitClientImpl::buildReports() {
 
   // Set the domain name.
   report.set_domain(domain_name_);
-  ENVOY_LOG(debug, "The usage report that will be sent to RLQS server:\n{}", report.DebugString());
   // Record after writeBucketsToTLS so the histogram captures the publish
   // cost too — operators see the full reporting-tick CPU. The publish
   // itself is also captured by bucket_cache_publish_us (subset metric)
@@ -521,6 +524,15 @@ void GlobalRateLimitClientImpl::reportQuotaUsage(const BucketId& bucket_id, cons
     if (!self) {
       return;
     }
+
+    const size_t id = hashBucketId(bucket_id);
+    BucketsCache& shard = self->mutableShardForBucket(id);
+    if (shard.find(id) == shard.end()) {
+      ENVOY_LOG(debug, "Skipping async report for evicted bucket: {}",
+                bucket_id.ShortDebugString());
+      return;
+    }
+
     RateLimitQuotaUsageReports report;
     report.set_domain(self->domain_name_);
     auto* bucket_usage = report.add_bucket_quota_usages();
@@ -541,6 +553,34 @@ void GlobalRateLimitClientImpl::reportQuotaUsage(const BucketId& bucket_id, cons
 
     self->sendUsageReportImpl(report);
   });
+}
+
+void GlobalRateLimitClientImpl::removeBucket(size_t id) {
+  std::weak_ptr<GlobalRateLimitClientImpl> weak = weak_from_this();
+  main_dispatcher_.post([weak, id]() {
+    if (auto self = weak.lock()) {
+      self->removeBucketImpl(id);
+    }
+  });
+}
+
+void GlobalRateLimitClientImpl::removeBucketImpl(size_t id) {
+  BucketsCache& shard = mutableShardForBucket(id);
+  auto it = shard.find(id);
+  if (it == shard.end()) {
+    return;
+  }
+  if (!isMultiDimGhostBaseBucket(it->second->bucket_id)) {
+    ENVOY_LOG(debug, "removeBucketImpl skipped non-ghost bucket {}",
+              it->second->bucket_id.ShortDebugString());
+    return;
+  }
+  ENVOY_LOG(info, "Evicting ghost multi-dim base bucket {}",
+            it->second->bucket_id.ShortDebugString());
+  const size_t shard_idx = shardOf(id);
+  shard.erase(it);
+  markShardDirty(shard_idx);
+  scheduleWriteBucketsToTLS();
 }
 
 void GlobalRateLimitClientImpl::createBucket(const BucketId& bucket_id, size_t id,
@@ -569,6 +609,12 @@ void GlobalRateLimitClientImpl::createBucketImpl(
     const BucketId& bucket_id, size_t id, const BucketAction& default_bucket_action,
     std::unique_ptr<RateLimitStrategy> fallback_action, std::chrono::milliseconds fallback_ttl,
     bool initial_request_allowed, const DenyResponseSettings& deny_response_settings) {
+  if (suppress_multi_dim_ghost_base_buckets_ && isMultiDimGhostBaseBucket(bucket_id)) {
+    ENVOY_LOG(warn, "Refusing to create ghost multi-dim base bucket {}",
+              bucket_id.ShortDebugString());
+    return;
+  }
+
   // On the first createBucket call (so the first time a bucket is hit in the
   // RLQS filter), start the stream & reporting timer.
   if (!stream_tried_by_bucket_creation_) {
@@ -619,7 +665,7 @@ void GlobalRateLimitClientImpl::createBucketImpl(
   std::shared_ptr<TokenBucket> new_token_bucket =
       createDefaultTokenBucketFromAction(default_fallback_action, time_source_);
 
-  ENVOY_LOG(info, "The TokenBucket for hash id: {} TokenBucket value: {}", id, bucket_id.DebugString());
+  ENVOY_LOG(debug, "Creating new bucket: bucket={} hash={}", bucket_id.ShortDebugString(), id);
 
   // Create degradation state for the new bucket
   auto degradation_state = std::make_shared<DegradationState>();
@@ -769,7 +815,7 @@ void GlobalRateLimitClientImpl::onQuotaResponseImpl(const RateLimitQuotaResponse
       if (degradation_changed) {
         ENVOY_LOG(info, "Bucket {} degradation mode changed: {} -> {}, "
                         "global_remaining: {}, threshold: {}, strict: {}, retry_after_ms: {}",
-                  bucket_id, was_degraded, is_degraded,
+                  action.bucket_id().ShortDebugString(), was_degraded, is_degraded,
                   degradation_info.global_remaining_tokens(),
                   degradation_info.degradation_threshold(),
                   strict_request_mode, deny_retry_after_ms);
@@ -842,10 +888,20 @@ void GlobalRateLimitClientImpl::onQuotaResponseImpl(const RateLimitQuotaResponse
 
           if (need_new_bucket) {
             bucket->token_bucket_limiter = createTokenBucketFromAction(rate_limit_strategy);
-            ENVOY_LOG(info,
-                      "A new TokenBucket has been configured by the RLQS "
-                      "filter for id: {}, reason: {}, max_tokens: {}",
-                      bucket_id, reason, rate_limit_strategy.token_bucket().max_tokens());
+            // Log at info only when the bucket is first created (exiting degradation
+            // or first assignment). Preallocation rebalances fire every reporting
+            // interval and are too noisy at info level.
+            if (reason == "no_existing_limiter") {
+              ENVOY_LOG(info,
+                        "TokenBucket created for bucket={} max_tokens={}",
+                        action.bucket_id().ShortDebugString(),
+                        rate_limit_strategy.token_bucket().max_tokens());
+            } else {
+              ENVOY_LOG(debug,
+                        "TokenBucket rebalanced for bucket={} reason={} max_tokens={}",
+                        action.bucket_id().ShortDebugString(), reason,
+                        rate_limit_strategy.token_bucket().max_tokens());
+            }
           } else {
             bucket->token_bucket_limiter = cached_bucket->token_bucket_limiter;
             ENVOY_LOG(debug,
@@ -914,7 +970,7 @@ void GlobalRateLimitClientImpl::onQuotaResponseImpl(const RateLimitQuotaResponse
     // Mirror the strict flag onto the cached bucket so the worker hot path
     // can read it without re-parsing the cached_action proto. Atomic write
     // pairs with the relaxed load in shouldAllowRequest's prologue.
-    bucket->strict_request_mode.store(strict_request_mode, std::memory_order_relaxed);
+    degradation_state->strict_request_mode.store(strict_request_mode, std::memory_order_relaxed);
 
     // Successful response observed for this bucket: refresh the heartbeat
     // timestamp used by the send-reports timer for self-quarantine (INV-9).
@@ -953,16 +1009,16 @@ void GlobalRateLimitClientImpl::onQuotaResponseImpl(const RateLimitQuotaResponse
     if (degradation_changed) {
       bool is_degraded = degradation_state->degraded.load(std::memory_order_relaxed);
       if (is_degraded) {
-        ENVOY_LOG(info, "ENTERING degradation mode for bucket {}, "
+        ENVOY_LOG(info, "ENTERING degradation mode for bucket={}, "
                         "global_remaining: {}, threshold: {}",
-                  bucket_id,
+                  cached_bucket->bucket_id.ShortDebugString(),
                   degradation_state->global_remaining_tokens.load(std::memory_order_relaxed),
                   degradation_state->degradation_threshold.load(std::memory_order_relaxed));
       } else {
-        ENVOY_LOG(info, "EXITING degradation mode for bucket {}, "
+        ENVOY_LOG(info, "EXITING degradation mode for bucket={}, "
                         "global_remaining: {}, threshold: {}, "
                         "TokenBucket will be recreated with new quota from server",
-                  bucket_id,
+                  cached_bucket->bucket_id.ShortDebugString(),
                   degradation_state->global_remaining_tokens.load(std::memory_order_relaxed),
                   degradation_state->degradation_threshold.load(std::memory_order_relaxed));
       }
@@ -977,8 +1033,8 @@ void GlobalRateLimitClientImpl::onQuotaResponseImpl(const RateLimitQuotaResponse
     // This prevents the race condition where local tokens consumed but not yet
     // reported could cause over-quota in synchronous mode.
     if (degradation_changed && degradation_state->degraded.load(std::memory_order_relaxed)) {
-      ENVOY_LOG(info, "Entering degradation mode for bucket {}, flushing local usage immediately",
-                bucket_id);
+      ENVOY_LOG(info, "Entering degradation mode for bucket={}, flushing local usage immediately",
+                cached_bucket->bucket_id.ShortDebugString());
       RateLimitQuotaUsageReports immediate_report = buildReports(bucket);
       sendUsageReportImpl(immediate_report);
     }
@@ -1075,8 +1131,10 @@ void GlobalRateLimitClientImpl::onSendReportsTimer() {
     }
   }
   if (reports.bucket_quota_usages().empty()) {
+    ENVOY_LOG(debug, "Skipping empty usage report for domain: {}", reports.domain());
     return;
   }
+  ENVOY_LOG(debug, "The usage report that will be sent to RLQS server:\n{}", reports.DebugString());
   sendUsageReportImpl(reports);
 }
 
@@ -1108,6 +1166,44 @@ void GlobalRateLimitClientImpl::onActionExpirationTimer(CachedBucket* bucket, si
     return;
   }
   std::shared_ptr<CachedBucket> cached_bucket = bucket_it->second;
+
+  // Lease fencing for concurrency buckets: when the server assignment
+  // expires, freeze the concurrency limit to the current active_requests
+  // count instead of falling back to default_action (which may be
+  // ALLOW_ALL). This prevents burst admission during server unavailability.
+  if (cached_bucket->cached_action &&
+      cached_bucket->cached_action->has_quota_assignment_action() &&
+      cached_bucket->cached_action->quota_assignment_action().has_concurrency_limit()) {
+    uint64_t current_active =
+        cached_bucket->quota_usage->active_requests.load(std::memory_order_relaxed);
+
+    ENVOY_LOG(info,
+              "RLQS: Concurrency lease expired for bucket {}, self-fencing "
+              "limit to current active_requests={}",
+              id, current_active);
+
+    // Build a new action with concurrency_limit frozen to current_active.
+    // No NEW requests can be admitted but existing in-flight requests can
+    // complete and decrement the counter.
+    std::unique_ptr<BucketAction> fenced_action = std::make_unique<BucketAction>();
+    fenced_action->mutable_quota_assignment_action()
+        ->mutable_concurrency_limit()
+        ->set_limit(current_active);
+
+    shard[id] = std::make_shared<CachedBucket>(
+        /*bucket_id=*/cached_bucket->bucket_id,
+        /*quota_usage=*/cached_bucket->quota_usage,
+        /*cached_action=*/std::move(fenced_action),
+        /*fallback_action=*/cached_bucket->fallback_action,
+        /*fallback_ttl=*/cached_bucket->fallback_ttl,
+        /*default_action=*/cached_bucket->default_action,
+        /*token_bucket_limiter=*/nullptr,
+        /*response_settings=*/cached_bucket->response_settings,
+        /*degradation_state=*/cached_bucket->degradation_state);
+    markShardDirtyForBucket(id);
+    writeBucketsToTLS();
+    return;
+  }
 
   // Without a fallback action, the cached action will be deleted and the bucket
   // will revert to its default action.

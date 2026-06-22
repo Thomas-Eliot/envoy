@@ -49,6 +49,8 @@ public:
   // is safe to reference so long as the local client exists.
   std::shared_ptr<CachedBucket> getBucket(size_t id) override;
 
+  void removeBucket(size_t id) override;
+
   void reportQuotaUsage(const BucketId& bucket_id, const QuotaUsage& usage) override;
 
   uint64_t recordHotspotAccess(size_t bucket_id_hash) override;

@@ -54,7 +54,10 @@ ConfigDiscoveryClient::ConfigDiscoveryClient(Grpc::RawAsyncClientSharedPtr async
                                              DynamicSettingsRegistrySharedPtr registry,
                                              std::chrono::milliseconds initial_backoff,
                                              std::chrono::milliseconds max_backoff,
-                                             size_t subscribed_max_entries)
+                                             size_t subscribed_max_entries,
+                                             std::chrono::milliseconds fetch_timeout,
+                                             std::chrono::milliseconds negative_cache_ttl,
+                                             std::chrono::milliseconds idle_eviction_ttl)
     : async_client_(std::move(async_client)), dispatcher_(dispatcher),
       registry_(std::move(registry)), initial_backoff_(initial_backoff),
       max_backoff_(max_backoff),
@@ -63,6 +66,9 @@ ConfigDiscoveryClient::ConfigDiscoveryClient(Grpc::RawAsyncClientSharedPtr async
       // as a defensive floor; tests pass small values intentionally and the
       // production default is already 32K.
       subscribed_max_(subscribed_max_entries == 0 ? 1 : subscribed_max_entries),
+      fetch_timeout_(fetch_timeout),
+      negative_cache_ttl_(negative_cache_ttl),
+      idle_eviction_ttl_(idle_eviction_ttl),
       service_method_(*Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
           std::string(kStreamMethodFullName))),
       get_quota_config_method_(Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
@@ -70,6 +76,9 @@ ConfigDiscoveryClient::ConfigDiscoveryClient(Grpc::RawAsyncClientSharedPtr async
       current_backoff_(initial_backoff) {}
 
 ConfigDiscoveryClient::~ConfigDiscoveryClient() {
+  if (eviction_timer_) {
+    eviction_timer_->disableTimer();
+  }
   if (reconnect_timer_) {
     reconnect_timer_->disableTimer();
   }
@@ -79,8 +88,15 @@ ConfigDiscoveryClient::~ConfigDiscoveryClient() {
     }
   }
   inflight_raw_requests_.clear();
+  for (auto& [key, callbacks] : inflight_requests_) {
+    for (auto& cb : callbacks) {
+      if (cb) {
+        cb(false);
+      }
+    }
+  }
+  inflight_requests_.clear();
   if (stream_ != nullptr) {
-    stream_->closeStream();
     stream_->resetStream();
     stream_ = nullptr;
   }
@@ -153,6 +169,7 @@ void ConfigDiscoveryClient::subscribeOnMain(absl::string_view tenant, absl::stri
     if (splitSubscriptionKey(evicted, evicted_tenant, evicted_scope)) {
       registry_->erase(evicted_tenant, evicted_scope);
     }
+    cache_expiry_.erase(evicted);
 
     subscribed_index_.erase(evicted);
     subscribed_lru_.pop_back();
@@ -292,6 +309,7 @@ bool ConfigDiscoveryClient::onReceiveMessageRaw(Buffer::InstancePtr&& response_b
         continue;
       }
       registry_->erase(tenant, scope);
+      cache_expiry_.erase(key);
       if (stats_.config_ds_abandon_applied != nullptr) {
         stats_.config_ds_abandon_applied->inc();
       }
@@ -377,13 +395,18 @@ void ConfigDiscoveryClient::onReconnectTimer() {
 void ConfigDiscoveryClient::fetchQuotaConfig(absl::string_view tenant, absl::string_view scope, FetchQuotaConfigCallback cb) {
   // Ensure we execute on the main dispatcher where inflight_requests_ and cache_expiry_ are thread-safe.
   if (!dispatcher_.isThreadSafe()) {
+    ENVOY_LOG(debug, "RLQS ConfigDS: fetchQuotaConfig cross-thread post tenant={} scope={}", tenant, scope);
     std::string t(tenant);
     std::string s(scope);
     // weak_from_this: same listener-drain protection as subscribeFromWorker.
     std::weak_ptr<ConfigDiscoveryClient> weak = weak_from_this();
     dispatcher_.post([weak, t = std::move(t), s = std::move(s), cb = std::move(cb)]() mutable {
       if (auto self = weak.lock()) {
+        ENVOY_LOG_MISC(debug, "RLQS ConfigDS: fetchQuotaConfig post landed on main thread");
         self->fetchQuotaConfig(t, s, std::move(cb));
+      } else if (cb) {
+        ENVOY_LOG_MISC(warn, "RLQS ConfigDS: fetchQuotaConfig client destroyed before post executed, failing callback");
+        cb(false);
       }
     });
     return;
@@ -399,9 +422,23 @@ void ConfigDiscoveryClient::fetchQuotaConfig(absl::string_view tenant, absl::str
 
   std::string key = DynamicSettingsRegistry::makeKey(tenant, scope);
 
+  // 0. Check negative cache (failed fetches) — skip the RPC entirely.
+  auto neg_it = negative_cache_expiry_.find(key);
+  if (neg_it != negative_cache_expiry_.end() &&
+      dispatcher_.timeSource().monotonicTime() < neg_it->second) {
+    if (stats_.negative_cache_hit) {
+      stats_.negative_cache_hit->inc();
+    }
+    ENVOY_LOG(debug, "ConfigDiscoveryClient: negative cache hit for {}, skipping fetch", key);
+    if (cb) cb(false);
+    return;
+  }
+
   // 1. Check TTL Cache
   auto expiry_it = cache_expiry_.find(key);
   if (expiry_it != cache_expiry_.end() && dispatcher_.timeSource().monotonicTime() < expiry_it->second) {
+    ENVOY_LOG(debug, "RLQS ConfigDS: fetchQuotaConfig TTL cache hit key={}", key);
+    touchAccessOnMain(key);
     if (cb) cb(true);
     return;
   }
@@ -445,12 +482,12 @@ void ConfigDiscoveryClient::fetchQuotaConfig(absl::string_view tenant, absl::str
   auto request = async_client_->sendRaw(
       get_quota_config_method_->service()->full_name(), get_quota_config_method_->name(),
       std::move(buffer), *request_cbs, Tracing::NullSpan::instance(),
-      Http::AsyncClient::RequestOptions());
+      Http::AsyncClient::RequestOptions().setTimeout(fetch_timeout_));
   
   if (request == nullptr) {
-    ENVOY_LOG(warn, "ConfigDiscoveryClient: failed to initiate getQuotaConfig request");
-    // onFailure was already called inline by sendRaw if it returns nullptr.
+    ENVOY_LOG(warn, "RLQS ConfigDS: GetQuotaConfig RPC failed inline for key={}", key);
   } else {
+    ENVOY_LOG(debug, "RLQS ConfigDS: GetQuotaConfig RPC dispatched for key={}", key);
     inflight_raw_requests_[key] = request;
   }
 }
@@ -461,21 +498,30 @@ void ConfigDiscoveryClient::invokeAndClearInflight(const std::string& key, bool 
   if (it != inflight_requests_.end()) {
     auto callbacks = std::move(it->second);
     inflight_requests_.erase(it);
+    ENVOY_LOG(debug, "RLQS ConfigDS: invoking {} inflight callbacks key={} success={}",
+              callbacks.size(), key, success);
     for (auto& cb : callbacks) {
       if (cb) cb(success);
     }
+  } else {
+    ENVOY_LOG(warn, "RLQS ConfigDS: invokeAndClearInflight key={} success={} but no inflight entry found", key, success);
   }
 }
 
 void ConfigDiscoveryClient::onFetchQuotaConfigSuccess(const std::string& tenant, const std::string& scope, Buffer::InstancePtr&& response_buffer) {
   envoy::service::rate_limit_quota_apig::v3::GetQuotaConfigResponse response;
   std::string key = DynamicSettingsRegistry::makeKey(tenant, scope);
+  ENVOY_LOG(debug, "ConfigDiscoveryClient: onFetchQuotaConfigSuccess for key={}, response_size={} bytes",
+            key, response_buffer ? response_buffer->length() : 0);
 
   if (!response.ParseFromString(response_buffer->toString())) {
-    ENVOY_LOG(warn, "ConfigDiscoveryClient: failed to parse GetQuotaConfigResponse");
+    ENVOY_LOG(warn, "ConfigDiscoveryClient: failed to parse GetQuotaConfigResponse for key={}", key);
     invokeAndClearInflight(key, false);
     return;
   }
+
+  ENVOY_LOG(debug, "ConfigDiscoveryClient: parsed GetQuotaConfigResponse for key={}, settings_size={}",
+            key, response.settings_size());
 
   // Update dynamic registry. Wrap each settings with a precomputed
   // bucket_id_builder string overlay so the filter hot path applies variant
@@ -489,8 +535,10 @@ void ConfigDiscoveryClient::onFetchQuotaConfigSuccess(const std::string& tenant,
   }
   registry_->update(tenant, scope, std::move(list));
 
-  // Update TTL
+  // Update TTL and clear any negative cache entry from a prior failure.
+  negative_cache_expiry_.erase(key);
   cache_expiry_[key] = dispatcher_.timeSource().monotonicTime() + config_ttl_;
+  touchAccessOnMain(key);
 
   // Add to LRU list to prevent repeated fetches. If the list is full, this will evict the oldest.
   subscribeOnMain(tenant, scope);
@@ -501,7 +549,75 @@ void ConfigDiscoveryClient::onFetchQuotaConfigSuccess(const std::string& tenant,
 void ConfigDiscoveryClient::onFetchQuotaConfigFailure(const std::string& tenant, const std::string& scope, Grpc::Status::GrpcStatus status, const std::string& message) {
   ENVOY_LOG(warn, "ConfigDiscoveryClient: getQuotaConfig failed for {}|{}: status={} message='{}'", tenant, scope, static_cast<int>(status), message);
   std::string key = DynamicSettingsRegistry::makeKey(tenant, scope);
+  if (negative_cache_ttl_.count() > 0) {
+    negative_cache_expiry_[key] =
+        dispatcher_.timeSource().monotonicTime() + negative_cache_ttl_;
+  }
   invokeAndClearInflight(key, false);
+}
+
+void ConfigDiscoveryClient::touchAccessFromWorker(absl::string_view tenant,
+                                                   absl::string_view scope) {
+  std::string t(tenant);
+  std::string s(scope);
+  std::weak_ptr<ConfigDiscoveryClient> weak = weak_from_this();
+  dispatcher_.post([weak, t = std::move(t), s = std::move(s)] {
+    if (auto self = weak.lock()) {
+      self->touchAccessOnMain(DynamicSettingsRegistry::makeKey(t, s));
+    }
+  });
+}
+
+void ConfigDiscoveryClient::touchAccessOnMain(const std::string& key) {
+  last_access_[key] = dispatcher_.timeSource().monotonicTime();
+}
+
+void ConfigDiscoveryClient::startEvictionTimer() {
+  if (idle_eviction_ttl_.count() <= 0 || eviction_timer_) {
+    return;
+  }
+  std::weak_ptr<ConfigDiscoveryClient> weak = weak_from_this();
+  eviction_timer_ = dispatcher_.createTimer([weak] {
+    if (auto self = weak.lock()) {
+      self->runIdleEviction();
+      self->eviction_timer_->enableTimer(std::chrono::seconds(10));
+    }
+  });
+  eviction_timer_->enableTimer(std::chrono::seconds(10));
+}
+
+void ConfigDiscoveryClient::runIdleEviction() {
+  if (last_access_.empty()) {
+    return;
+  }
+  auto now = dispatcher_.timeSource().monotonicTime();
+  std::vector<std::string> keys_to_evict;
+  for (const auto& [key, last_access] : last_access_) {
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_access) >
+        idle_eviction_ttl_) {
+      keys_to_evict.push_back(key);
+    }
+  }
+  if (keys_to_evict.empty()) {
+    return;
+  }
+  for (const auto& key : keys_to_evict) {
+    std::string tenant, scope;
+    if (splitSubscriptionKey(key, tenant, scope)) {
+      registry_->erase(tenant, scope);
+    }
+    cache_expiry_.erase(key);
+    negative_cache_expiry_.erase(key);
+    if (auto it = subscribed_index_.find(key); it != subscribed_index_.end()) {
+      subscribed_lru_.erase(it->second);
+      subscribed_index_.erase(it);
+    }
+    last_access_.erase(key);
+    if (stats_.idle_eviction != nullptr) {
+      stats_.idle_eviction->inc();
+    }
+  }
+  ENVOY_LOG(info, "ConfigDiscoveryClient: idle eviction swept {} entries", keys_to_evict.size());
 }
 
 } // namespace RateLimitQuotaApig

@@ -130,7 +130,8 @@ Http::FilterFactoryCb RateLimitQuotaFilterFactory::createFilterFactoryFromProtoT
       createGlobalRateLimitClientImpl(context, filter_config.domain(), reporting_interval,
                                       tls_store->buckets_tls, config_with_hash_key,
                                       enable_global_hotspot, max_tracked_bucket_hashes,
-                                      hotspot_window, max_bucket_cache_entries));
+                                      hotspot_window, max_bucket_cache_entries,
+                                      config->isDynamicMode()));
   // Wire spec § D-6 abandon-action counter into the global client so the data
   // path can record server abandons as they arrive in RLQS responses.
   if (tl_global_client->global_client) {
@@ -189,7 +190,7 @@ Http::FilterFactoryCb RateLimitQuotaFilterFactory::createFilterFactoryFromProtoT
 
           auto checker = std::make_shared<GrpcStreamSyncQuotaChecker>(
               std::move(async_client), domain, dispatcher,
-              false // fallback_allow_on_error (fail-close) for strict rate limiting
+              true // fallback_allow_on_error (fail-open): allow on timeout/error
           );
           return std::make_shared<ThreadLocalSyncQuotaChecker>(checker);
         });
@@ -198,6 +199,48 @@ Http::FilterFactoryCb RateLimitQuotaFilterFactory::createFilterFactoryFromProtoT
   } else {
     ENVOY_LOG(debug, "rlqs_server not configured, "
                      "degradation mode will use fallback behavior");
+  }
+
+  // Emit a single startup summary so operators can confirm effective timeouts
+  // and operating mode without needing debug logs. Defaults mirror filter.cc.
+  {
+    constexpr int64_t kDefaultTimeoutMs = 100;
+    const bool dynamic_mode = config->isDynamicMode();
+    int64_t cold_ms = kDefaultTimeoutMs;
+    int64_t degrade_ms = kDefaultTimeoutMs;
+    if (filter_config.has_cold_hot_config() &&
+        filter_config.cold_hot_config().has_cold_sync_timeout()) {
+      const auto& d = filter_config.cold_hot_config().cold_sync_timeout();
+      cold_ms = d.seconds() * 1000 + d.nanos() / 1000000;
+    } else if (filter_config.has_degradation_mode_config() &&
+               filter_config.degradation_mode_config().has_sync_check_timeout()) {
+      const auto& d = filter_config.degradation_mode_config().sync_check_timeout();
+      cold_ms = d.seconds() * 1000 + d.nanos() / 1000000;
+    }
+    if (filter_config.has_degradation_mode_config() &&
+        filter_config.degradation_mode_config().has_sync_check_timeout()) {
+      const auto& d = filter_config.degradation_mode_config().sync_check_timeout();
+      degrade_ms = d.seconds() * 1000 + d.nanos() / 1000000;
+    }
+    bool fallback_allow = true; // default: fail-open
+    if (filter_config.has_degradation_mode_config()) {
+      const auto& dm = filter_config.degradation_mode_config();
+      if (dm.has_fallback_allow_on_timeout()) {
+        fallback_allow = dm.fallback_allow_on_timeout().value();
+      }
+    } else if (filter_config.has_cold_hot_config()) {
+      const auto& ch = filter_config.cold_hot_config();
+      if (ch.has_cold_fallback_allow_on_error()) {
+        fallback_allow = ch.cold_fallback_allow_on_error().value();
+      }
+    }
+    ENVOY_LOG(info,
+              "RLQS filter ready: domain={} mode={} cold_sync_timeout={}ms "
+              "degradation_sync_timeout={}ms fallback_allow_on_timeout={}",
+              filter_config.domain(),
+              dynamic_mode ? "dynamic(rlqs_config_server)" : "static",
+              cold_ms, degrade_ms,
+              fallback_allow ? "true" : "false");
   }
 
   // Spec § D-8: stand up the RLQS Config Discovery client whenever
@@ -232,8 +275,24 @@ Http::FilterFactoryCb RateLimitQuotaFilterFactory::createFilterFactoryFromProtoT
             ->createUncachedRawAsyncClient();
 
     auto& main_dispatcher = context.getServerFactoryContext().mainThreadDispatcher();
+
+    std::chrono::milliseconds negative_cache_ttl = std::chrono::seconds(30);
+    if (filter_config.has_config_fetch_negative_cache_ttl()) {
+      const auto& d = filter_config.config_fetch_negative_cache_ttl();
+      negative_cache_ttl = std::chrono::milliseconds(d.seconds() * 1000 + d.nanos() / 1000000);
+    }
+
+    std::chrono::milliseconds idle_eviction_ttl = std::chrono::seconds(20);
+    if (filter_config.has_config_idle_eviction_ttl()) {
+      const auto& d = filter_config.config_idle_eviction_ttl();
+      idle_eviction_ttl = std::chrono::milliseconds(d.seconds() * 1000 + d.nanos() / 1000000);
+    }
+
     tls_store->config_discovery_client = std::make_shared<ConfigDiscoveryClient>(
-        std::move(config_ds_async_client), main_dispatcher, tls_store->dynamic_registry);
+        std::move(config_ds_async_client), main_dispatcher, tls_store->dynamic_registry,
+        std::chrono::seconds(1), std::chrono::seconds(30),
+        ConfigDiscoveryClient::kDefaultSubscribedMaxEntries,
+        std::chrono::seconds(5), negative_cache_ttl, idle_eviction_ttl);
     // Wire the FilterConfig stats into the discovery client. Without this the
     // 6 config_discovery_* counters declared in filter.h stay at zero —
     // operators have no signal of stream churn or malformed pushes. The
@@ -252,6 +311,8 @@ Http::FilterFactoryCb RateLimitQuotaFilterFactory::createFilterFactoryFromProtoT
           &s.config_discovery_settings_missing_binding_tag_;
       ds_stats.subscription_evicted = &s.config_discovery_subscription_evicted_;
       ds_stats.config_ds_abandon_applied = &s.config_discovery_abandon_applied_;
+      ds_stats.negative_cache_hit = &s.config_discovery_negative_cache_hit_;
+      ds_stats.idle_eviction = &s.config_discovery_idle_evicted_;
       tls_store->config_discovery_client->setStats(ds_stats);
     }
     // Defer start() onto the main dispatcher so the stream open runs after
@@ -259,7 +320,10 @@ Http::FilterFactoryCb RateLimitQuotaFilterFactory::createFilterFactoryFromProtoT
     // clients in this filter (GrpcStreamSyncQuotaChecker) are started on
     // first use.
     auto client_for_post = tls_store->config_discovery_client;
-    main_dispatcher.post([client_for_post] { client_for_post->start(); });
+    main_dispatcher.post([client_for_post] {
+      client_for_post->start();
+      client_for_post->startEvictionTimer();
+    });
     ENVOY_LOG(info, "RateLimitQuotaConfigDiscoveryService client configured (spec § D-8)");
   } else {
     ENVOY_LOG(debug, "rlqs_config_server not configured; using static xDS BucketSettings only");

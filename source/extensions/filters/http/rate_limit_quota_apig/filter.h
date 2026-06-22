@@ -66,6 +66,15 @@ struct RouteMd5Cache : public ThreadLocal::ThreadLocalObject {
   absl::flat_hash_map<std::string, std::string> cache;
 };
 
+// Per-worker dedup for config access touch notifications. Prevents flooding
+// the main dispatcher with cross-thread posts when the same (tenant, scope)
+// is accessed by every request. Each worker tracks its own last-touch
+// timestamps; a touch is posted to main at most once per kTouchDedupInterval
+// per (tenant, scope) per worker.
+struct ConfigAccessDedup : public ThreadLocal::ThreadLocalObject {
+  absl::flat_hash_map<std::string, MonotonicTime> last_touch;
+};
+
 /**
  * All local rate limit stats. @see stats_macros.h
  */
@@ -110,6 +119,9 @@ struct RouteMd5Cache : public ThreadLocal::ThreadLocalObject {
    * yield a non-empty tenant; success means a non-_unknown value was found. */                    \
   COUNTER(tenant_extract_success)                                                                  \
   COUNTER(tenant_extract_unknown)                                                                  \
+  /* Per-request dynamic metadata (set by set_metadata or another upstream                         \
+   * HTTP filter) provided the tenant_id before the order-based resolution. */                     \
+  COUNTER(tenant_extract_dynamic_metadata)                                                         \
   /* FILTER_CHAIN_NAME RE2 didn't match the configured chain_name_pattern.                         \
    * High rate suggests a stale pattern or chain-name rename. */                                   \
   COUNTER(tenant_chain_regex_unmatched)                                                            \
@@ -132,6 +144,7 @@ struct RouteMd5Cache : public ThreadLocal::ThreadLocalObject {
    * subscribed resource_name. Healthy churn signal; sustained high                                 \
    * rate vs response_received warrants config review. */                                          \
   COUNTER(config_discovery_abandon_applied)                                                        \
+  COUNTER(config_discovery_negative_cache_hit)                                                      \
   /* DynamicSettingsRegistry traffic — spec § D-7 multi-dim fan-out                                \
    * observability. Together with the variant counters below, operators see                        \
    * the warm-up curve (variants_missing initially → variants_cached steady). */                   \
@@ -163,7 +176,13 @@ struct RouteMd5Cache : public ThreadLocal::ThreadLocalObject {
    * Bumped once per snapshot republish (update / erase) so operators can                          \
    * watch server-push churn against the filter's COW cost before the same                         \
    * sharded refactor lands here. */                                                               \
-  COUNTER(dynamic_registry_publish_total)
+  COUNTER(dynamic_registry_publish_total)                                                         \
+  /* Idle eviction: bumped once per (tenant, scope) entry evicted from the                         \
+   * DynamicSettingsRegistry by ConfigDiscoveryClient's periodic sweep.                            \
+   * Non-zero means configs are aging out of cache; sustained high rate                            \
+   * vs response_received suggests high route churn or an overly short                             \
+   * config_idle_eviction_ttl. */                                                                  \
+  COUNTER(config_discovery_idle_evicted)
 
 /**
  * Struct definition for all local rate limit stats. @see stats_macros.h
@@ -299,8 +318,8 @@ public:
   const std::string& tenantMetadataField() const { return tenant_metadata_field_; }
 
   // Cached MD5-hex of route_name for the ROUTE_NAME scope path. Without this
-  // cache, the default ScopeConfig (disable_route_name_hash=false) MD5s the
-  // route name on every request — pure waste, since route names are stable
+  // cache, ScopeConfig with enable_route_name_hash=true MD5s the route name
+  // on every request — pure waste, since route names are stable
   // across the lifetime of this FilterConfig. Bounded to prevent unbounded
   // growth in pathological cases (e.g. regex-derived route names with
   // unbounded cardinality); once the cap is hit, further misses fall back
@@ -310,6 +329,13 @@ public:
   // Envoy's threading guarantees that each worker is the sole reader and
   // writer of its own `RouteMd5Cache`, so the hot path takes zero locks.
   std::string cachedRouteNameMd5(absl::string_view route_name) const;
+
+  // Returns true when a config-access touch notification should be posted to
+  // the main thread for this (tenant, scope). Per-worker TLS dedup ensures at
+  // most one cross-thread post per kConfigAccessTouchDedupSec per key per
+  // worker. Called from the filter's hot path on every dynamic-registry hit.
+  bool shouldTouchConfigAccess(absl::string_view tenant, absl::string_view scope,
+                               TimeSource& time_source) const;
 
   // Listener-level metadata snapshot captured at filter-config creation time.
   // Spec § D-1 / § 7: LISTENER_METADATA tenant extraction reads from the
@@ -408,11 +434,14 @@ private:
   // normal operation. The cap applies per-worker (each TLS slot has its own
   // map), so worst-case memory ≈ N_workers × cap × ~64 B = a few MB.
   static constexpr size_t kRouteNameMd5CacheCap = 4096;
+  static constexpr size_t kConfigAccessDedupCap = 4096;
+  static constexpr int64_t kConfigAccessTouchDedupSec = 5;
   // TLS slot: each worker holds its own RouteMd5Cache instance, populated
   // lazily on first MD5 miss. set() at FilterConfig construction posts the
   // factory to every worker dispatcher; until a worker's slot is populated
   // (brief startup window), cachedRouteNameMd5 falls back to direct md5Hex.
   mutable ThreadLocal::TypedSlot<RouteMd5Cache> route_md5_tls_;
+  mutable ThreadLocal::TypedSlot<ConfigAccessDedup> config_access_dedup_tls_;
 };
 using FilterConfigConstSharedPtr = std::shared_ptr<const FilterConfig>;
 
@@ -461,15 +490,6 @@ public:
         token_usage_accumulator_(config_->extractAgentTokenUsage()) {}
 
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap&, bool end_stream) override;
-  // decodeHeaders returns StopIteration while a synchronous quota check (cold
-  // path / degraded SyncCheck / token-dim sync) is in flight. For requests that
-  // carry a body (end_stream=false on headers), the inherited
-  // PassThroughFilter::decodeData returns Continue, which RESUMES iteration and
-  // forwards the request upstream before the check resolves — so the server's
-  // deny arrives too late and the request is never blocked. Hold the body /
-  // trailers until the async callback calls continueDecoding().
-  Http::FilterDataStatus decodeData(Buffer::Instance&, bool end_stream) override;
-  Http::FilterTrailersStatus decodeTrailers(Http::RequestTrailerMap&) override;
   Http::FilterHeadersStatus encodeHeaders(Http::ResponseHeaderMap&, bool end_stream) override;
   Http::FilterDataStatus encodeData(Buffer::Instance&, bool end_stream) override;
   void onDestroy() override;
@@ -481,7 +501,7 @@ public:
   }
 
   // AsyncQuotaCheckCallbacks implementation
-  void onQuotaCheckComplete(bool allowed) override;
+  void onQuotaCheckComplete(bool allowed, uint32_t deny_retry_after_ms = 0) override;
   void onQuotaCheckError() override;
 
   // Callback for when ConfigDiscoveryClient finishes fetching the quota config.
@@ -547,6 +567,13 @@ private:
   // empty when either piece is missing (filter falls back to single-dim).
   std::pair<std::string, std::string>
   extractTenantScopeKey(const BucketId& base_bucket_id_proto) const;
+
+  // Dynamic multi-dim mode must never create or use base buckets (those
+  // without a `_dim` overlay). Evict any ghost base bucket and continue
+  // without single-dim fallback.
+  void evictGhostBaseBucketIfPresent(const BucketId& base_bucket_id_proto);
+  Http::FilterHeadersStatus continueMultiDimWarmupWithoutBaseBucket(
+      const BucketId& base_bucket_id_proto);
 
   // Initiate async quota check for degradation mode.
   // Returns true if async check was started (request should be paused).
@@ -673,6 +700,7 @@ private:
   // filter's worker dispatcher. If the filter is destroyed before the posted
   // closure runs, the guard prevents use-after-free.
   std::shared_ptr<std::atomic<bool>> config_fetch_alive_guard_;
+  Event::TimerPtr config_fetch_timer_;
 
   // State for async quota check
   bool waiting_for_quota_check_{false};
@@ -710,6 +738,9 @@ private:
   // pending. Captured at initiateAsyncQuotaCheck so the callback can
   // re-resolve to the live bucket without re-deriving from the matcher.
   size_t pending_strict_bucket_id_hash_{0};
+  // Server-provided deny-cache TTL from the last SyncCheck response.
+  // 0 = no caching (every request goes through SyncCheck).
+  uint32_t pending_deny_retry_after_ms_{0};
 
   // State for token tracking
   std::shared_ptr<QuotaUsage> pending_token_quota_usage_;

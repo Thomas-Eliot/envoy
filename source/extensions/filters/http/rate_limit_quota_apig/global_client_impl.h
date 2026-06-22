@@ -156,7 +156,8 @@ public:
                             Envoy::Event::Dispatcher& main_dispatcher, bool enable_global_hotspot,
                             size_t max_tracked_bucket_hashes,
                             std::chrono::milliseconds hotspot_frequency_window,
-                            size_t max_bucket_cache_entries);
+                            size_t max_bucket_cache_entries,
+                            bool suppress_multi_dim_ghost_base_buckets = false);
   ~GlobalRateLimitClientImpl() override;
 
   void onReceiveMessage(RateLimitQuotaResponsePtr&& response) override;
@@ -176,6 +177,8 @@ public:
                     std::unique_ptr<envoy::type::v3::RateLimitStrategy> fallback_action,
                     std::chrono::milliseconds fallback_ttl, bool initial_request_allowed,
                     const DenyResponseSettings& deny_response_settings);
+
+  void removeBucket(size_t id);
 
   // Cold/hot frequency; thread-safe. No-op (returns max) when global hotspot is disabled.
   uint64_t recordHotspotAccess(size_t bucket_id_hash);
@@ -341,6 +344,7 @@ private:
                         std::unique_ptr<envoy::type::v3::RateLimitStrategy> fallback_action,
                         std::chrono::milliseconds fallback_ttl, bool initial_request_allowed,
                         const DenyResponseSettings& deny_response_settings);
+  void removeBucketImpl(size_t id);
   void sendUsageReportImpl(const RateLimitQuotaUsageReports& reports);
   void onQuotaResponseImpl(const RateLimitQuotaResponse* response);
   bool startStreamImpl();
@@ -422,6 +426,10 @@ private:
   // Upper bound on main-thread bucket map size before aggressive idle eviction (1 min vs 5 min).
   const size_t max_bucket_cache_entries_;
 
+  // When true (rlqs_config_server / dynamic multi-dim mode), refuse to create
+  // or heartbeat base buckets that carry _tenant/_scope but no _dim overlay.
+  const bool suppress_multi_dim_ghost_base_buckets_;
+
   // Starts when the filter is hit for the first time. From then on, this
   // timer's trigger ensures the health of the RLQS stream & sends aggregated
   // usage reports.
@@ -476,13 +484,15 @@ createGlobalRateLimitClientImpl(Server::Configuration::FactoryContext& context,
                                 Grpc::GrpcServiceConfigWithHashKey& config_with_hash_key,
                                 bool enable_global_hotspot, size_t max_tracked_bucket_hashes,
                                 std::chrono::milliseconds hotspot_frequency_window,
-                                size_t max_bucket_cache_entries) {
+                                size_t max_bucket_cache_entries,
+                                bool suppress_multi_dim_ghost_base_buckets = false) {
   Envoy::Event::Dispatcher& main_dispatcher =
       context.getServerFactoryContext().mainThreadDispatcher();
   return std::make_shared<GlobalRateLimitClientImpl>(
       config_with_hash_key, context, domain_name, send_reports_interval, buckets_tls,
       main_dispatcher, enable_global_hotspot, max_tracked_bucket_hashes,
-      hotspot_frequency_window, max_bucket_cache_entries);
+      hotspot_frequency_window, max_bucket_cache_entries,
+      suppress_multi_dim_ghost_base_buckets);
 }
 
 struct ThreadLocalGlobalRateLimitClientImpl : public Envoy::ThreadLocal::ThreadLocalObject {

@@ -49,9 +49,9 @@ static std::string extractUsageObject(absl::string_view buf);
 namespace {
 
 // MD5(input) → 32-char lower-case hex. Used to bound the length of the
-// route_name component of `_scope` when ScopeConfig.disable_route_name_hash is
-// false (default), so user-defined route names of arbitrary length stay within
-// the rate-limit service's Redis key length budget.
+// route_name component of `_scope` when ScopeConfig.enable_route_name_hash is
+// true, so user-defined route names of arbitrary length stay within the
+// rate-limit service's Redis key length budget.
 std::string md5Hex(absl::string_view input) {
   uint8_t digest[MD5_DIGEST_LENGTH];
   MD5(reinterpret_cast<const uint8_t*>(input.data()), input.size(), digest);
@@ -76,40 +76,82 @@ Matcher::MatchTreeSharedPtr<Http::HttpMatchingData> createMatcher(
 } // namespace
 
 namespace {
+constexpr std::chrono::milliseconds kDefaultSyncCheckTimeout{100};
+constexpr bool kDefaultFallbackAllowOnTimeout = true;
+
+using DegradationModeConfig =
+    envoy::extensions::filters::http::rate_limit_quota_apig::v3::DegradationModeConfig;
+using ColdHotSplitConfig =
+    envoy::extensions::filters::http::rate_limit_quota_apig::v3::ColdHotSplitConfig;
+
+std::chrono::milliseconds durationToMs(const google::protobuf::Duration& d) {
+  return std::chrono::milliseconds(d.seconds() * 1000 + d.nanos() / 1000000);
+}
+
+bool readFallbackAllowOnTimeout(const DegradationModeConfig& dm) {
+  if (dm.has_fallback_allow_on_timeout()) {
+    return dm.fallback_allow_on_timeout().value();
+  }
+  return kDefaultFallbackAllowOnTimeout;
+}
+
+bool readColdFallbackAllowOnError(const ColdHotSplitConfig& ch) {
+  if (ch.has_cold_fallback_allow_on_error()) {
+    return ch.cold_fallback_allow_on_error().value();
+  }
+  return kDefaultFallbackAllowOnTimeout;
+}
+
 std::chrono::milliseconds coldPathTimeoutValue(
     const envoy::extensions::filters::http::rate_limit_quota_apig::v3::RateLimitQuotaFilterConfig&
         cfg) {
   if (cfg.has_cold_hot_config() && cfg.cold_hot_config().has_cold_sync_timeout()) {
-    const auto& d = cfg.cold_hot_config().cold_sync_timeout();
-    return std::chrono::milliseconds(d.seconds() * 1000 + d.nanos() / 1000000);
+    return durationToMs(cfg.cold_hot_config().cold_sync_timeout());
   }
   if (cfg.has_degradation_mode_config() && cfg.degradation_mode_config().has_sync_check_timeout()) {
-    const auto& d = cfg.degradation_mode_config().sync_check_timeout();
-    return std::chrono::milliseconds(d.seconds() * 1000 + d.nanos() / 1000000);
+    return durationToMs(cfg.degradation_mode_config().sync_check_timeout());
   }
-  return std::chrono::milliseconds(20);
+  return kDefaultSyncCheckTimeout;
 }
 
 std::chrono::milliseconds degradationSyncTimeoutValue(
     const envoy::extensions::filters::http::rate_limit_quota_apig::v3::RateLimitQuotaFilterConfig&
         cfg) {
   if (cfg.has_degradation_mode_config() && cfg.degradation_mode_config().has_sync_check_timeout()) {
-    const auto& d = cfg.degradation_mode_config().sync_check_timeout();
+    return durationToMs(cfg.degradation_mode_config().sync_check_timeout());
+  }
+  return kDefaultSyncCheckTimeout;
+}
+
+std::chrono::milliseconds configFetchTimeoutValue(
+    const envoy::extensions::filters::http::rate_limit_quota_apig::v3::RateLimitQuotaFilterConfig&
+        cfg) {
+  if (cfg.has_config_fetch_timeout()) {
+    const auto& d = cfg.config_fetch_timeout();
     return std::chrono::milliseconds(d.seconds() * 1000 + d.nanos() / 1000000);
   }
-  return std::chrono::milliseconds(20);
+  return std::chrono::milliseconds(2000);
 }
 
 bool coldPathErrorFallbackAllow(
     const envoy::extensions::filters::http::rate_limit_quota_apig::v3::RateLimitQuotaFilterConfig&
         cfg) {
   if (cfg.has_cold_hot_config()) {
-    return cfg.cold_hot_config().cold_fallback_allow_on_error();
+    return readColdFallbackAllowOnError(cfg.cold_hot_config());
   }
   if (cfg.has_degradation_mode_config()) {
-    return cfg.degradation_mode_config().fallback_allow_on_timeout();
+    return readFallbackAllowOnTimeout(cfg.degradation_mode_config());
   }
-  return false;
+  return kDefaultFallbackAllowOnTimeout;
+}
+
+bool degradationErrorFallbackAllow(
+    const envoy::extensions::filters::http::rate_limit_quota_apig::v3::RateLimitQuotaFilterConfig&
+        cfg) {
+  if (cfg.has_degradation_mode_config()) {
+    return readFallbackAllowOnTimeout(cfg.degradation_mode_config());
+  }
+  return kDefaultFallbackAllowOnTimeout;
 }
 
 // A rule is "token dimension" iff its BucketId carries `_dim:token`. The
@@ -215,6 +257,28 @@ std::string FilterConfig::cachedRouteNameMd5(absl::string_view route_name) const
   return hash;
 }
 
+bool FilterConfig::shouldTouchConfigAccess(absl::string_view tenant, absl::string_view scope,
+                                           TimeSource& time_source) const {
+  auto dedup_ref = config_access_dedup_tls_.get();
+  if (!dedup_ref.has_value()) {
+    return true;
+  }
+  auto& dedup = dedup_ref->last_touch;
+  const std::string key = DynamicSettingsRegistry::makeKey(tenant, scope);
+  auto now = time_source.monotonicTime();
+  auto it = dedup.find(key);
+  if (it != dedup.end() &&
+      std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count() <
+          kConfigAccessTouchDedupSec) {
+    return false;
+  }
+  if (dedup.size() >= kConfigAccessDedupCap && it == dedup.end()) {
+    return true;
+  }
+  dedup[key] = now;
+  return true;
+}
+
 FilterConfig::FilterConfig(
     const envoy::extensions::filters::http::rate_limit_quota_apig::v3::RateLimitQuotaFilterConfig&
         proto_config,
@@ -270,11 +334,14 @@ FilterConfig::FilterConfig(
            !proto_config.tenant_key_source().tenant().metadata_field().empty())
               ? proto_config.tenant_key_source().tenant().metadata_field()
               : "tenant_id"),
-      route_md5_tls_(factory_context.threadLocal()) {
+      route_md5_tls_(factory_context.threadLocal()),
+      config_access_dedup_tls_(factory_context.threadLocal()) {
   // Post the per-worker RouteMd5Cache factory. Each worker dispatcher will
   // run the lambda once when it processes the post; until then, the slot
   // returns empty and cachedRouteNameMd5 falls back to direct md5Hex.
   route_md5_tls_.set([](Event::Dispatcher&) { return std::make_shared<RouteMd5Cache>(); });
+  config_access_dedup_tls_.set(
+      [](Event::Dispatcher&) { return std::make_shared<ConfigAccessDedup>(); });
 
   if (proto_config.has_tenant_key_source() && proto_config.tenant_key_source().has_tenant()) {
     const auto& tenant_cfg = proto_config.tenant_key_source().tenant();
@@ -410,8 +477,26 @@ Http::FilterHeadersStatus RateLimitQuotaFilter::decodeHeaders(Http::RequestHeade
     if (key_source.has_tenant()) {
       const auto& t_cfg = key_source.tenant();
       std::string tenant_id;
-      
-      for (const auto& source_type : t_cfg.order()) {
+
+      {
+        const auto& ns = config_->tenantMetadataNamespace();
+        const auto& field = config_->tenantMetadataField();
+        const auto& dynamic_meta = callbacks_->streamInfo().dynamicMetadata().filter_metadata();
+        auto it = dynamic_meta.find(ns);
+        if (it != dynamic_meta.end()) {
+          const auto& fields = it->second.fields();
+          auto f_it = fields.find(field);
+          if (f_it != fields.end() &&
+              f_it->second.kind_case() == ProtobufWkt::Value::kStringValue &&
+              !f_it->second.string_value().empty()) {
+            tenant_id = f_it->second.string_value();
+            config_->stats().tenant_extract_dynamic_metadata_.inc();
+          }
+        }
+      }
+
+      if (tenant_id.empty()) {
+        for (const auto& source_type : t_cfg.order()) {
         if (source_type == envoy::extensions::filters::http::rate_limit_quota_apig::v3::TenantKeySource_TenantConfig_SourceType_LISTENER_METADATA) {
           // F-1.2: ns / field defaults pre-resolved at config load. Per-request
           // path is now a pure hashmap lookup with no std::string temporaries.
@@ -473,7 +558,8 @@ Http::FilterHeadersStatus RateLimitQuotaFilter::decodeHeaders(Http::RequestHeade
             }
           }
         }
-      }
+        }
+      } // if (tenant_id.empty())
 
       // _tenant fallback: when no source resolves a value, write a sentinel
       // ("_unknown") instead of leaving the key absent. This keeps each
@@ -501,10 +587,7 @@ Http::FilterHeadersStatus RateLimitQuotaFilter::decodeHeaders(Http::RequestHeade
           default_prefix = "route:";
           if (callbacks_->route() && callbacks_->route()->routeEntry()) {
             scope_value = callbacks_->route()->routeEntry()->routeName();
-            // Hash route_name by default — see ScopeConfig.disable_route_name_hash.
-            // Use the FilterConfig-level cache so the MD5 only runs once per
-            // unique route name across the listener's lifetime.
-            if (!scope_value.empty() && !s_cfg.disable_route_name_hash()) {
+            if (!scope_value.empty() && s_cfg.enable_route_name_hash()) {
               scope_value = config_->cachedRouteNameMd5(scope_value);
             }
           }
@@ -589,6 +672,16 @@ Http::FilterHeadersStatus RateLimitQuotaFilter::decodeHeaders(Http::RequestHeade
   if (auto multi_dim_status = tryDynamicMultiDimensionCheck(bucket_id_proto, match_action);
       multi_dim_status.has_value()) {
     return *multi_dim_status;
+  }
+
+  // Dynamic multi-dim mode must never create ghost base buckets — base
+  // BucketIds that carry _tenant/_scope but no _dim overlay. When
+  // tryDynamicMultiDimensionCheck returns nullopt (registry miss or empty
+  // variant list), evict any stale ghost entry and fail-open so the request
+  // passes through while the server pushes the real per-dim settings.
+  if (config_->isDynamicMode() && isMultiDimGhostBaseBucket(bucket_id_proto)) {
+    evictGhostBaseBucketIfPresent(bucket_id_proto);
+    return continueMultiDimWarmupWithoutBaseBucket(bucket_id_proto);
   }
 
   std::shared_ptr<CachedBucket> cached_bucket = client_->getBucket(bucket_id);
@@ -678,32 +771,6 @@ Http::FilterHeadersStatus RateLimitQuotaFilter::decodeHeaders(Http::RequestHeade
   return processCachedBucket(deny_response_settings, bucket_id_proto, match_action.bucketSettings());
 }
 
-Http::FilterDataStatus RateLimitQuotaFilter::decodeData(Buffer::Instance&, bool) {
-  // When decodeHeaders started a synchronous quota check it returned
-  // StopIteration to pause the request until the RLQS SyncCheck (cold path,
-  // degraded-mode SyncCheck, or token-dim sync) resolves. StopIteration only
-  // pauses HEADER iteration; the request body still arrives here, and the
-  // inherited PassThroughFilter::decodeData returns Continue — which resumes
-  // the whole filter chain and ships the request to the upstream BEFORE the
-  // check's allow/deny is known. The late deny is then dropped
-  // ("Received response but no pending checks in queue") and over-quota
-  // requests are never blocked. Buffer the body until the async callback
-  // (onQuotaCheckComplete / timeout) calls continueDecoding().
-  if (waiting_for_quota_check_) {
-    return Http::FilterDataStatus::StopIterationAndBuffer;
-  }
-  return Http::FilterDataStatus::Continue;
-}
-
-Http::FilterTrailersStatus RateLimitQuotaFilter::decodeTrailers(Http::RequestTrailerMap&) {
-  // Same rationale as decodeData: never let trailers continue the request
-  // while a synchronous quota check is still pending.
-  if (waiting_for_quota_check_) {
-    return Http::FilterTrailersStatus::StopIteration;
-  }
-  return Http::FilterTrailersStatus::Continue;
-}
-
 void RateLimitQuotaFilter::createMatcher(const xds::type::matcher::v3::Matcher& matcher) {
   RateLimitOnMatchActionContext context;
   Matcher::MatchTreeFactory<Http::HttpMatchingData, RateLimitOnMatchActionContext> factory(
@@ -763,6 +830,10 @@ void RateLimitQuotaFilter::onDestroy() {
   // closure becomes a no-op if it arrives after this filter is destroyed.
   if (config_fetch_alive_guard_) {
     config_fetch_alive_guard_->store(false, std::memory_order_release);
+  }
+  if (config_fetch_timer_) {
+    config_fetch_timer_->disableTimer();
+    config_fetch_timer_.reset();
   }
 
   // Cancel any pending async quota check
@@ -997,7 +1068,8 @@ bool RateLimitQuotaFilter::initiateAsyncQuotaCheck(const CachedBucket& cached_bu
   // concurrency) callers leave all three fields cleared, preserving
   // existing behavior.
   pending_strict_request_mode_ =
-      cached_bucket.strict_request_mode.load(std::memory_order_relaxed);
+      cached_bucket.degradation_state &&
+      cached_bucket.degradation_state->strict_request_mode.load(std::memory_order_relaxed);
   if (pending_strict_request_mode_ && client_) {
     pending_strict_bucket_id_hash_ = hashBucketId(cached_bucket.bucket_id);
     pending_strict_bucket_ = client_->getBucket(pending_strict_bucket_id_hash_);
@@ -1020,15 +1092,55 @@ bool RateLimitQuotaFilter::initiateAsyncQuotaCheck(const CachedBucket& cached_bu
 }
 
 void RateLimitQuotaFilter::onQuotaConfigFetchComplete(bool success) {
+  ENVOY_LOG(debug, "RLQS MultiDim: onQuotaConfigFetchComplete success={} waiting={}",
+            success, waiting_for_quota_config_);
   if (!waiting_for_quota_config_) {
+    ENVOY_LOG(debug, "RLQS MultiDim: onQuotaConfigFetchComplete spurious callback, ignoring");
     return;
   }
-  
+  if (success && dynamic_registry_) {
+    // Look up the result so we can report the variant count at info level.
+    const auto& base = pending_bucket_id_proto_;
+    std::string tenant, scope;
+    for (const auto& kv : base.bucket()) {
+      if (kv.first == "_tenant") tenant = kv.second;
+      else if (kv.first == "_scope") scope = kv.second;
+    }
+    const auto variants = dynamic_registry_->lookup(tenant, scope);
+    ENVOY_LOG(info, "RLQS MultiDim: config fetch complete tenant={} scope={} variants={}",
+              tenant, scope, variants.size());
+  } else if (!success) {
+    std::string tenant, scope;
+    for (const auto& kv : pending_bucket_id_proto_.bucket()) {
+      if (kv.first == "_tenant") tenant = kv.second;
+      else if (kv.first == "_scope") scope = kv.second;
+    }
+    ENVOY_LOG(warn, "RLQS MultiDim: config fetch FAILED tenant={} scope={}, falling back",
+              tenant, scope);
+  }
+
+  if (config_fetch_timer_) {
+    config_fetch_timer_->disableTimer();
+    config_fetch_timer_.reset();
+  }
+
   waiting_for_quota_config_ = false;
 
   const auto& deny = pending_match_action_->bucketSettings().deny_response_settings();
 
+  // Helper: in dynamic mode a ghost base bucket must never be created even
+  // in fallback paths. Evict any stale ghost and fail-open instead.
+  const bool suppress_ghost = config_->isDynamicMode() &&
+                              isMultiDimGhostBaseBucket(pending_bucket_id_proto_);
+
   if (!success) {
+    if (suppress_ghost) {
+      ENVOY_LOG(warn, "Dynamic multi-dim config fetch failed for ghost base bucket {}; failing open",
+                pending_bucket_id_proto_.ShortDebugString());
+      evictGhostBaseBucketIfPresent(pending_bucket_id_proto_);
+      callbacks_->continueDecoding();
+      return;
+    }
     // Fetch failed, fall back to single-dim.
     auto status = processCachedBucket(deny, pending_bucket_id_proto_, pending_match_action_->bucketSettings());
     if (status == Http::FilterHeadersStatus::Continue) {
@@ -1043,10 +1155,40 @@ void RateLimitQuotaFilter::onQuotaConfigFetchComplete(bool success) {
     if (multi_status.value() == Http::FilterHeadersStatus::Continue) {
       callbacks_->continueDecoding();
     } else if (multi_status.value() == Http::FilterHeadersStatus::StopIteration) {
-      // It suspended again (e.g. for sync check). Do nothing.
+      if (waiting_for_quota_config_) {
+        // Re-evaluation triggered another config fetch (e.g. server returned
+        // empty settings so the cache is still empty). Break the loop: cancel
+        // the new fetch, disarm its timer, and fall back to single-dim.
+        waiting_for_quota_config_ = false;
+        if (config_fetch_timer_) {
+          config_fetch_timer_->disableTimer();
+          config_fetch_timer_.reset();
+        }
+        if (suppress_ghost) {
+          ENVOY_LOG(warn, "Dynamic multi-dim re-fetch loop detected for ghost base bucket {}; failing open",
+                    pending_bucket_id_proto_.ShortDebugString());
+          evictGhostBaseBucketIfPresent(pending_bucket_id_proto_);
+          callbacks_->continueDecoding();
+          return;
+        }
+        auto status = processCachedBucket(deny, pending_bucket_id_proto_,
+                                          pending_match_action_->bucketSettings());
+        if (status == Http::FilterHeadersStatus::Continue) {
+          callbacks_->continueDecoding();
+        }
+      }
+      // Otherwise it suspended for a sync check (Phase 2). Do nothing —
+      // resumeMultiDimAfterSyncCheck will handle continuation.
     }
   } else {
     // Dynamic check fell back to single-dim.
+    if (suppress_ghost) {
+      ENVOY_LOG(debug, "Dynamic multi-dim: no variants for ghost base bucket {}; failing open",
+                pending_bucket_id_proto_.ShortDebugString());
+      evictGhostBaseBucketIfPresent(pending_bucket_id_proto_);
+      callbacks_->continueDecoding();
+      return;
+    }
     auto status = processCachedBucket(deny, pending_bucket_id_proto_, pending_match_action_->bucketSettings());
     if (status == Http::FilterHeadersStatus::Continue) {
       callbacks_->continueDecoding();
@@ -1054,8 +1196,9 @@ void RateLimitQuotaFilter::onQuotaConfigFetchComplete(bool success) {
   }
 }
 
-void RateLimitQuotaFilter::onQuotaCheckComplete(bool allowed) {
+void RateLimitQuotaFilter::onQuotaCheckComplete(bool allowed, uint32_t deny_retry_after_ms) {
   waiting_for_quota_check_ = false;
+  pending_deny_retry_after_ms_ = deny_retry_after_ms;
 
   // Token-dim always-sync dispatch. Owns the cleanest path: no concurrency
   // bookkeeping, no strict-mode deny cache, no cold/degraded fan-out. The
@@ -1199,13 +1342,13 @@ void RateLimitQuotaFilter::onQuotaCheckComplete(bool allowed) {
     pending_strict_bucket_id_hash_ = 0;
     callbacks_->continueDecoding();
   } else {
-    // Strict-request DENY: prime the local deny-cache so the immediately-
-    // following requests short-circuit to local DENY without a fresh
-    // SyncCheck round trip. The TTL is the constant fallback when the
-    // server didn't include a deny_retry_after_ms hint (older servers)
-    // — the next non-degraded response clears the cache anyway.
-    // INV-10 + plan §C.4.
-    primeStrictDenyCache(strict_request::kFallbackDenyTtlNs);
+    // Strict-request DENY: use the server-provided deny_retry_after_ms to
+    // control the local deny cache. 0 = no caching (every request goes
+    // through SyncCheck for 100% accuracy on small quotas).
+    if (pending_deny_retry_after_ms_ > 0) {
+      primeStrictDenyCache(
+          static_cast<int64_t>(pending_deny_retry_after_ms_) * 1'000'000LL);
+    }
     if (pending_quota_usage_) {
       incrementAtomic(pending_quota_usage_->num_requests_denied);
     }
@@ -1269,11 +1412,8 @@ void RateLimitQuotaFilter::onQuotaCheckError() {
   }
 
   const auto& top = config_->config();
-  bool fallback_allow = is_cold
-                            ? coldPathErrorFallbackAllow(top)
-                            : (top.has_degradation_mode_config()
-                                   ? top.degradation_mode_config().fallback_allow_on_timeout()
-                                   : false);
+  bool fallback_allow =
+      is_cold ? coldPathErrorFallbackAllow(top) : degradationErrorFallbackAllow(top);
 
   // Strict-request fail-closed (INV-10). When the bucket opted into 100%
   // accuracy via DegradationInfo.strict_request_mode, an RPC error MUST
@@ -1386,6 +1526,21 @@ RateLimitQuotaFilter::extractTenantScopeKey(const BucketId& base_bucket_id_proto
   return {t_it->second, s_it->second};
 }
 
+void RateLimitQuotaFilter::evictGhostBaseBucketIfPresent(const BucketId& base_bucket_id_proto) {
+  if (client_) {
+    client_->removeBucket(hashBucketId(base_bucket_id_proto));
+  }
+}
+
+Http::FilterHeadersStatus RateLimitQuotaFilter::continueMultiDimWarmupWithoutBaseBucket(
+    const BucketId& base_bucket_id_proto) {
+  ENVOY_LOG(debug,
+            "Dynamic multi-dim: suppressing ghost base bucket {}, bypassing "
+            "single-dim warm-up path",
+            base_bucket_id_proto.ShortDebugString());
+  return Http::FilterHeadersStatus::Continue;
+}
+
 absl::optional<Http::FilterHeadersStatus>
 RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
     const BucketId& base_bucket_id_proto,
@@ -1413,33 +1568,53 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
       auto settings_list = dynamic_registry_->lookup(tenant, scope);
       if (settings_list.empty()) {
         // Not cached. Suspend the request and fetch.
+        ENVOY_LOG(info, "RLQS MultiDim: registry miss tenant={} scope={}, suspending request to fetch config",
+                  tenant, scope);
         waiting_for_quota_config_ = true;
         pending_bucket_id_proto_ = base_bucket_id_proto;
-        
-        // We must copy match_action because the reference might become invalid 
-        // after decodeHeaders returns StopIteration. 
+
+        // We must copy match_action because the reference might become invalid
+        // after decodeHeaders returns StopIteration.
         pending_match_action_ = std::make_unique<RateLimitOnMatchAction>(
             match_action.bucketSettings()
         );
-        
+
         config_fetch_alive_guard_ = std::make_shared<std::atomic<bool>>(true);
         auto guard = config_fetch_alive_guard_;
-        Event::Dispatcher& worker_dispatcher = callbacks_->dispatcher();
+        Event::Dispatcher* worker_dispatcher_ptr = &callbacks_->dispatcher();
         RateLimitQuotaFilter* filter_ptr = this;
         config_discovery_client_->fetchQuotaConfig(tenant, scope,
-            [guard, &worker_dispatcher, filter_ptr](bool success) {
-              worker_dispatcher.post([guard, filter_ptr, success]() {
+            [guard, worker_dispatcher_ptr, filter_ptr](bool success) {
+              ENVOY_LOG_MISC(debug, "RLQS MultiDim: config fetch callback on main thread, success={}, posting to worker",
+                             success);
+              worker_dispatcher_ptr->post([guard, filter_ptr, success]() {
+                ENVOY_LOG_MISC(debug, "RLQS MultiDim: config fetch result on worker thread, guard_alive={} success={}",
+                               guard->load(std::memory_order_acquire), success);
                 if (!guard->load(std::memory_order_acquire)) {
+                  ENVOY_LOG_MISC(info, "RLQS MultiDim: filter destroyed before config fetch callback, dropping");
                   return;
                 }
                 filter_ptr->onQuotaConfigFetchComplete(success);
               });
             });
+        config_fetch_timer_ = callbacks_->dispatcher().createTimer([this]() {
+          ENVOY_LOG(warn, "RLQS MultiDim: config fetch timeout expired, falling back to single-dim");
+          onQuotaConfigFetchComplete(false);
+        });
+        auto timeout_ms = configFetchTimeoutValue(config_->config());
+        config_fetch_timer_->enableTimer(timeout_ms);
+        ENVOY_LOG(debug, "RLQS MultiDim: config fetch timer armed timeout_ms={}, suspending request",
+                  timeout_ms.count());
         return Http::FilterHeadersStatus::StopIteration;
+      } else {
+        ENVOY_LOG(debug, "tryDynamicMultiDimensionCheck: registry hit for tenant={} scope={}, "
+                  "settings_count={}", tenant, scope, settings_list.size());
       }
     } else {
       // If we are already waiting, this means we are in the re-evaluation phase.
       // We shouldn't fetch again. Just proceed to check the cache.
+      ENVOY_LOG(debug, "tryDynamicMultiDimensionCheck: re-evaluation phase, "
+                "skipping fetch for tenant={} scope={}", tenant, scope);
       waiting_for_quota_config_ = false;
     }
   }
@@ -1455,6 +1630,11 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
     return absl::nullopt; // server hasn't pushed yet → single-dim fallback
   }
   config_->stats().dynamic_registry_lookup_hit_.inc();
+
+  if (config_discovery_client_ &&
+      config_->shouldTouchConfigAccess(tenant, scope, time_source_)) {
+    config_discovery_client_->touchAccessFromWorker(tenant, scope);
+  }
 
   // Build variant BucketIds and look up each in the cache. Variants that
   // are missing are NOT a hard failure — we register them via createBucket
@@ -1506,6 +1686,9 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
   // deny_response_settings (per-dim deny payload). This is a side-effect
   // registration; we do not block on a sync check for these.
   if (any_missing) {
+    bool any_initial_denied = false;
+    DenyResponseSettings final_deny_settings;
+
     for (auto& v : variants) {
       if (v.cached) {
         continue;
@@ -1528,6 +1711,11 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
             ->mutable_rate_limit_strategy()
             ->set_blanket_rule(RateLimitStrategy::ALLOW_ALL);
       }
+      if (!allow_initial) {
+        any_initial_denied = true;
+        final_deny_settings = v.settings->deny_response_settings();
+      }
+
       std::unique_ptr<RateLimitStrategy> expiration_fallback;
       std::chrono::milliseconds expiration_ttl{0};
       if (v.settings->has_expired_assignment_behavior() &&
@@ -1548,10 +1736,32 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
       ENVOY_LOG(debug, "Multi-dim: registered variant BucketId for warm-up: {}",
                 v.id.ShortDebugString());
     }
-    // Defer the actual quota decision to the single-dim path for this
-    // request — variants need at least one round-trip with the server
-    // before they're truly checkable.
-    return absl::nullopt;
+
+    if (any_initial_denied) {
+      pending_deny_settings_ = final_deny_settings;
+      buildDenyDetailsLazy(base_bucket_id_proto);
+      config_->stats().rate_limited_.inc();
+      return sendDenyResponse(callbacks_, final_deny_settings, StreamInfo::ResponseFlag::RateLimited, deny_details_);
+    }
+
+    for (const auto& v : variants) {
+      if (isTokenDimensionBucket(v.id)) {
+        auto cached = client_->getBucket(v.hash);
+        if (cached) {
+          pending_token_quota_usage_ = cached->quota_usage;
+        } else {
+          std::chrono::nanoseconds now = nowMonotonicNsTyped(callbacks_->dispatcher().timeSource());
+          pending_token_quota_usage_ = std::make_shared<QuotaUsage>(0, 0, now);
+        }
+        resetTokenUsageState();
+        cold_path_bucket_id_ = v.id;
+        break;
+      }
+    }
+
+    // Bypass single-dim path so we don't create an unused base bucket.
+    // Variants will be synced on the next request.
+    return Http::FilterHeadersStatus::Continue;
   }
 
   // All variants cached. Two-phase 100%-accurate dispatch:
@@ -1661,8 +1871,8 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
     // the headline P2 fix.
     const bool strict_request_degraded =
         !variant_is_concurrency &&
-        v.cached->strict_request_mode.load(std::memory_order_relaxed) &&
         v.cached->degradation_state &&
+        v.cached->degradation_state->strict_request_mode.load(std::memory_order_relaxed) &&
         v.cached->degradation_state->degraded.load(std::memory_order_acquire);
     if (strict_request_degraded) {
       ENVOY_LOG(debug,
@@ -1680,7 +1890,8 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
     // "100% strict" flag; server-side AllocConcurrencyStrict sets it when
     // ConcurrencyStrictMode is opt-in'd for the bucket.
     if (variant_is_concurrency &&
-        v.cached->strict_request_mode.load(std::memory_order_relaxed)) {
+        v.cached->degradation_state &&
+        v.cached->degradation_state->strict_request_mode.load(std::memory_order_relaxed)) {
       uint64_t limit = variant_action.quota_assignment_action().concurrency_limit().limit();
       uint64_t current_active =
           v.cached->quota_usage->active_requests.load(std::memory_order_relaxed);
@@ -1696,6 +1907,18 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
     }
 
     if (!shouldAllowRequest(*v.cached)) {
+      // Local tokens exhausted — defer to Phase 2 SyncCheck to consume from
+      // the global reserve pool, same as the strict_request_degraded path.
+      if (!variant_is_concurrency &&
+          v.cached->degradation_state &&
+          sync_quota_checker_) {
+        ENVOY_LOG(debug,
+                  "Multi-dim: variant {} local tokens exhausted → deferring to SyncCheck",
+                  v.id.ShortDebugString());
+        multi_dim_state_->deferred.push_back(
+            {v.id, v.cached, v.settings, /*is_concurrency=*/false});
+        continue;
+      }
       rollbackMultiDimPending(multi_dim_state_->pending);
       multi_dim_state_->final_deny_response_settings = v.settings->deny_response_settings();
       auto status = sendDenyResponse(callbacks_, multi_dim_state_->final_deny_response_settings,
@@ -1704,7 +1927,7 @@ RateLimitQuotaFilter::tryDynamicMultiDimensionCheck(
       config_->stats().rate_limited_.inc();
       config_->stats().multi_dim_denied_.inc();
       multi_dim_state_.reset();
-      ENVOY_LOG(debug, "Multi-dim: denied by variant BucketId {}", v.id.ShortDebugString());
+      ENVOY_LOG(info, "Multi-dim: rate limited by bucket={}", v.id.ShortDebugString());
       return status;
     }
     // Account the allowance against this dim's QuotaUsage so the next
@@ -1776,21 +1999,20 @@ Http::FilterHeadersStatus RateLimitQuotaFilter::sendNextDeferredMultiDimSyncChec
   // path will call onQuotaCheckComplete / onQuotaCheckError; those branch
   // on multi_dim_state_ to route back here.
   if (!sync_quota_checker_) {
-    // No checker wired — degrade to fail-closed. Prime the deny cache so
-    // subsequent requests for this variant short-circuit without
-    // re-attempting the dispatch.
-    rollbackMultiDimPending(multi_dim_state_->pending);
+    // No checker wired — fail-open: allow request and continue processing
+    // remaining deferred variants without rate-limiting.
     auto& v = multi_dim_state_->deferred[multi_dim_state_->deferred_cursor];
-    v.cached->deny_until_ns.store(nowMonotonicNs(time_source_) +
-                                      strict_request::kFallbackDenyTtlNs,
-                                  std::memory_order_relaxed);
-    auto status = sendDenyResponse(callbacks_, v.settings->deny_response_settings(),
-                                   StreamInfo::ResponseFlag::RateLimited,
-                                   multi_dim_state_->deny_details);
-    config_->stats().rate_limited_.inc();
-    config_->stats().multi_dim_denied_.inc();
-    multi_dim_state_.reset();
-    return status;
+    v.cached->quota_usage->num_requests_allowed.fetch_add(1, std::memory_order_relaxed);
+    if (v.is_concurrency) {
+      uint64_t current = v.cached->quota_usage->active_requests.load(std::memory_order_relaxed);
+      while (!v.cached->quota_usage->active_requests.compare_exchange_weak(
+          current, current + 1, std::memory_order_relaxed)) {
+      }
+      multi_dim_active_quota_usages_.push_back(v.cached->quota_usage);
+    }
+    multi_dim_state_->deferred_cursor++;
+    config_->stats().degraded_sync_error_.inc();
+    return sendNextDeferredMultiDimSyncCheck();
   }
 
   auto& v = multi_dim_state_->deferred[multi_dim_state_->deferred_cursor];
@@ -1849,9 +2071,12 @@ void RateLimitQuotaFilter::resumeMultiDimAfterSyncCheck(bool allowed) {
     // prime deny cache for THIS variant, send deny response. Same shape
     // as Phase 1 sync deny.
     rollbackMultiDimPending(s.pending);
-    v.cached->deny_until_ns.store(nowMonotonicNs(time_source_) +
-                                      strict_request::kFallbackDenyTtlNs,
-                                  std::memory_order_relaxed);
+    if (pending_deny_retry_after_ms_ > 0) {
+      v.cached->deny_until_ns.store(
+          nowMonotonicNs(time_source_) +
+              static_cast<int64_t>(pending_deny_retry_after_ms_) * 1'000'000LL,
+          std::memory_order_relaxed);
+    }
     s.final_deny_response_settings = v.settings->deny_response_settings();
     config_->stats().rate_limited_.inc();
     config_->stats().multi_dim_denied_.inc();
@@ -1864,19 +2089,19 @@ void RateLimitQuotaFilter::resumeMultiDimAfterSyncCheck(bool allowed) {
     return;
   }
 
-  // SyncCheck ALLOW for this variant. Apply local INC; for concurrency
-  // variant the existing degraded handling expects unconditional CAS+1
-  // on active_requests (per filter.cc:1018-1024 semantics). For request
-  // strict variant (token-bucket shape), the server-side `used` counter
-  // already INC'd atomically; filter just records the variant for
-  // statistics and rollback bookkeeping.
+  // SyncCheck ALLOW for this variant. For concurrency variant the existing
+  // degraded handling expects unconditional CAS+1 on active_requests.
+  // For non-concurrency (strict-request): do NOT increment num_requests_allowed.
+  // SyncCheck already atomically counted this request in Redis (total_tokens).
+  // Incrementing here would cause the periodic report to double-count,
+  // and unreported increments at window boundaries cause cross-window pollution.
   if (v.is_concurrency) {
     uint64_t current = v.cached->quota_usage->active_requests.load(std::memory_order_relaxed);
     while (!v.cached->quota_usage->active_requests.compare_exchange_weak(
         current, current + 1, std::memory_order_relaxed)) {
     }
+    v.cached->quota_usage->num_requests_allowed.fetch_add(1, std::memory_order_relaxed);
   }
-  v.cached->quota_usage->num_requests_allowed.fetch_add(1, std::memory_order_relaxed);
   s.pending.push_back({v.cached, v.is_concurrency});
   s.deferred_cursor++;
 
@@ -1926,23 +2151,25 @@ void RateLimitQuotaFilter::abortMultiDimAfterError() {
     return;
   }
 
-  rollbackMultiDimPending(s.pending);
+  // Fail-open: commit the current deferred variant as allowed and continue
+  // processing remaining deferred variants without rate-limiting.
   if (s.deferred_cursor < s.deferred.size()) {
     auto& v = s.deferred[s.deferred_cursor];
-    v.cached->deny_until_ns.store(nowMonotonicNs(time_source_) +
-                                      strict_request::kFallbackDenyTtlNs,
-                                  std::memory_order_relaxed);
-    s.final_deny_response_settings = v.settings->deny_response_settings();
+    v.cached->quota_usage->num_requests_allowed.fetch_add(1, std::memory_order_relaxed);
+    if (v.is_concurrency) {
+      uint64_t current = v.cached->quota_usage->active_requests.load(std::memory_order_relaxed);
+      while (!v.cached->quota_usage->active_requests.compare_exchange_weak(
+          current, current + 1, std::memory_order_relaxed)) {
+      }
+      multi_dim_active_quota_usages_.push_back(v.cached->quota_usage);
+    }
+    s.deferred_cursor++;
   }
-  config_->stats().rate_limited_.inc();
-  config_->stats().multi_dim_denied_.inc();
   config_->stats().degraded_sync_error_.inc();
-  callbacks_->sendLocalReply(getDenyResponseCode(s.final_deny_response_settings),
-                             s.final_deny_response_settings.http_body().value(),
-                             addDenyResponseHeadersCb(s.final_deny_response_settings),
-                             absl::nullopt, s.deny_details);
-  callbacks_->streamInfo().setResponseFlag(StreamInfo::ResponseFlag::RateLimited);
-  multi_dim_state_.reset();
+  auto status = sendNextDeferredMultiDimSyncCheck();
+  if (status == Http::FilterHeadersStatus::Continue) {
+    callbacks_->continueDecoding();
+  }
 }
 
 Http::FilterHeadersStatus RateLimitQuotaFilter::processCachedBucket(
@@ -2058,11 +2285,8 @@ RateLimitQuotaFilter::processCachedBucket(const DenyResponseSettings& deny_respo
       return Envoy::Http::FilterHeadersStatus::StopIteration;
     }
 
-    // Failed to initiate async check, use fallback behavior
-    bool fallback_allow = false; // Default to fail-close for strict limiting
-    if (config_->config().has_degradation_mode_config()) {
-      fallback_allow = config_->config().degradation_mode_config().fallback_allow_on_timeout();
-    }
+    // Failed to initiate async check, use fallback behavior.
+    const bool fallback_allow = degradationErrorFallbackAllow(config_->config());
     ENVOY_LOG(warn, "Failed to initiate async quota check in degraded mode, "
                     "falling back to {} behavior",
               fallback_allow ? "allow" : "deny");
@@ -2091,19 +2315,45 @@ RateLimitQuotaFilter::processCachedBucket(const DenyResponseSettings& deny_respo
   // Normal mode: use local token bucket or concurrency limit
   if (shouldAllowRequest(cached_bucket)) {
     incrementAtomic(quota_usage->num_requests_allowed);
-    
+
     if (is_concurrency_limit) {
       concurrency_incremented_ = true;
       active_quota_usage_ = quota_usage;
-      ENVOY_LOG(debug, "Concurrency incremented tracking set for bucket_id={}", 
+      ENVOY_LOG(debug, "Concurrency incremented tracking set for bucket_id={}",
                 cached_bucket.bucket_id.ShortDebugString());
     }
 
     ENVOY_LOG(debug, "Rate limit decision: allowed=true, mode=normal, "
-                     "tokens_remaining={}", 
-              cached_bucket.token_bucket_limiter ? 
+                     "tokens_remaining={}",
+              cached_bucket.token_bucket_limiter ?
               cached_bucket.token_bucket_limiter->remainingTokens() : 0);
     return Envoy::Http::FilterHeadersStatus::Continue;
+  }
+
+  // Local token bucket exhausted — try SyncCheck to consume from the global
+  // reserve pool before denying. This eliminates the Phase 1 gap where the
+  // instance has no local tokens but the server hasn't signalled degraded yet.
+  // Skipped for:
+  //   - concurrency mode (uses active_requests gauge, not tokens)
+  //   - strict_request_mode (秒级/小额度 buckets where SyncCheck is sole
+  //     authority via forceDegradation; adding a fallback here would cause
+  //     double-counting during brief window-transition non-degraded gaps)
+  const bool is_strict_request =
+      cached_bucket.degradation_state &&
+      cached_bucket.degradation_state->strict_request_mode.load(std::memory_order_relaxed);
+  if (!degradation_mode_disabled &&
+      !is_concurrency_limit &&
+      !is_strict_request &&
+      cached_bucket.degradation_state &&
+      sync_quota_checker_) {
+    ENVOY_LOG(debug, "Local tokens exhausted, falling back to SyncCheck for reserve pool");
+    pending_quota_usage_ = quota_usage;
+    pending_deny_settings_ = deny_response_settings;
+    is_concurrency_limit_pending_ = false;
+    if (initiateAsyncQuotaCheck(cached_bucket)) {
+      return Envoy::Http::FilterHeadersStatus::StopIteration;
+    }
+    pending_quota_usage_.reset();
   }
 
   incrementAtomic(quota_usage->num_requests_denied);

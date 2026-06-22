@@ -83,6 +83,8 @@ struct ConfigDiscoveryClientStats {
   // deleted upstream); a sustained high rate compared to response_received
   // suggests churn that may warrant configuration review.
   Stats::Counter* config_ds_abandon_applied = nullptr;
+  Stats::Counter* negative_cache_hit = nullptr;
+  Stats::Counter* idle_eviction = nullptr;
 };
 
 // enable_shared_from_this is load-bearing: subscribeFromWorker /
@@ -116,7 +118,10 @@ public:
                         DynamicSettingsRegistrySharedPtr registry,
                         std::chrono::milliseconds initial_backoff = std::chrono::seconds(1),
                         std::chrono::milliseconds max_backoff = std::chrono::seconds(30),
-                        size_t subscribed_max_entries = kDefaultSubscribedMaxEntries);
+                        size_t subscribed_max_entries = kDefaultSubscribedMaxEntries,
+                        std::chrono::milliseconds fetch_timeout = std::chrono::seconds(5),
+                        std::chrono::milliseconds negative_cache_ttl = std::chrono::seconds(30),
+                        std::chrono::milliseconds idle_eviction_ttl = std::chrono::seconds(20));
 
   // setStats wires per-stream observability counters. Optional — when
   // unset, every helper short-circuits (nil counters), so tests that
@@ -168,6 +173,18 @@ public:
   // The callback is invoked when the response arrives (or fails). The result is parsed
   // and pushed into the DynamicSettingsRegistry automatically.
   void fetchQuotaConfig(absl::string_view tenant, absl::string_view scope, FetchQuotaConfigCallback cb);
+
+  // Notify that a (tenant, scope) config was accessed at request time.
+  // Thread-safe — workers post the timestamp update onto the main dispatcher.
+  // The eviction timer reads last_access_ to identify idle entries.
+  void touchAccessFromWorker(absl::string_view tenant, absl::string_view scope);
+
+  // Start the idle eviction timer. Must be called after construction when
+  // the shared_ptr is fully assigned (weak_from_this is available). No-op
+  // when idle_eviction_ttl is zero (eviction disabled).
+  void startEvictionTimer();
+
+  size_t lastAccessCountForTest() const { return last_access_.size(); }
 
   private:
   // Async gRPC callback object owned by the async_client_ until the response
@@ -233,12 +250,22 @@ public:
   // max_backoff_; doubles current_backoff_ each call until cap.
   void scheduleReconnect();
 
+  // Update the last-access timestamp for a key. Main-thread only.
+  void touchAccessOnMain(const std::string& key);
+
+  // Periodic idle eviction sweep. Walks last_access_, evicts entries that
+  // have not been touched for longer than idle_eviction_ttl_.
+  void runIdleEviction();
+
   Grpc::RawAsyncClientSharedPtr async_client_;
   Event::Dispatcher& dispatcher_;
   DynamicSettingsRegistrySharedPtr registry_;
   const std::chrono::milliseconds initial_backoff_;
   const std::chrono::milliseconds max_backoff_;
   const size_t subscribed_max_;
+  const std::chrono::milliseconds fetch_timeout_;
+  const std::chrono::milliseconds negative_cache_ttl_;
+  const std::chrono::milliseconds idle_eviction_ttl_;
 
   // Singleflight tracking for on-demand fetch. Maps `tenant|scope` to a list of callbacks.
   absl::flat_hash_map<std::string, std::vector<FetchQuotaConfigCallback>> inflight_requests_;
@@ -248,6 +275,11 @@ public:
 
   // TTL tracking for dynamically fetched configs. Maps `tenant|scope` to expiration time.
   absl::flat_hash_map<std::string, MonotonicTime> cache_expiry_;
+
+  // Negative cache for failed config fetches. Maps `tenant|scope` to expiration time.
+  // When a fetch fails, subsequent requests skip the RPC and immediately fall back
+  // to single-dimension processing until the TTL expires.
+  absl::flat_hash_map<std::string, MonotonicTime> negative_cache_expiry_;
 
   // Default TTL for dynamically fetched configs (5 minutes).
   const std::chrono::milliseconds config_ttl_{std::chrono::minutes(5)};
@@ -304,6 +336,10 @@ public:
   // Reconnect machinery.
   Event::TimerPtr reconnect_timer_;
   std::chrono::milliseconds current_backoff_;
+
+  // Idle eviction: last-access timestamps and sweep timer.
+  absl::flat_hash_map<std::string, MonotonicTime> last_access_;
+  Event::TimerPtr eviction_timer_;
 
   // Observability counters set by setStats(). Default is all-nullptr; every
   // increment site nil-checks each pointer so unwired tests pay no overhead.

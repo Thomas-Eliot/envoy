@@ -42,6 +42,13 @@ std::shared_ptr<CachedBucket> LocalRateLimitClientImpl::getBucket(size_t id) {
   return (bucket_it != shard->end()) ? bucket_it->second : nullptr;
 }
 
+void LocalRateLimitClientImpl::removeBucket(size_t id) {
+  std::shared_ptr<GlobalRateLimitClientImpl> global_client = getGlobalClient();
+  if (global_client != nullptr) {
+    global_client->removeBucket(id);
+  }
+}
+
 void LocalRateLimitClientImpl::reportQuotaUsage(const BucketId& bucket_id, const QuotaUsage& usage) {
   std::shared_ptr<GlobalRateLimitClientImpl> global_client = getGlobalClient();
   if (global_client != nullptr) {
