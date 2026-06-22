@@ -771,6 +771,32 @@ Http::FilterHeadersStatus RateLimitQuotaFilter::decodeHeaders(Http::RequestHeade
   return processCachedBucket(deny_response_settings, bucket_id_proto, match_action.bucketSettings());
 }
 
+Http::FilterDataStatus RateLimitQuotaFilter::decodeData(Buffer::Instance&, bool) {
+  // When decodeHeaders started a synchronous quota check it set
+  // waiting_for_quota_check_ and returned StopIteration to pause the request
+  // until the RLQS SyncCheck (cold path, degraded-mode SyncCheck, or token-dim
+  // sync) resolves. StopIteration only pauses HEADER iteration; the request
+  // body still arrives here, and the inherited PassThroughFilter::decodeData
+  // returns Continue — which resumes the whole filter chain and ships the
+  // request to the upstream BEFORE the check's allow/deny is known. The late
+  // deny is then dropped ("Received response but no pending checks in queue")
+  // and over-quota requests are never blocked. Buffer the body until the async
+  // callback (onQuotaCheckComplete / timeout) calls continueDecoding().
+  if (waiting_for_quota_check_) {
+    return Http::FilterDataStatus::StopIterationAndBuffer;
+  }
+  return Http::FilterDataStatus::Continue;
+}
+
+Http::FilterTrailersStatus RateLimitQuotaFilter::decodeTrailers(Http::RequestTrailerMap&) {
+  // Same rationale as decodeData: never let trailers continue the request
+  // while a synchronous quota check is still pending.
+  if (waiting_for_quota_check_) {
+    return Http::FilterTrailersStatus::StopIteration;
+  }
+  return Http::FilterTrailersStatus::Continue;
+}
+
 void RateLimitQuotaFilter::createMatcher(const xds::type::matcher::v3::Matcher& matcher) {
   RateLimitOnMatchActionContext context;
   Matcher::MatchTreeFactory<Http::HttpMatchingData, RateLimitOnMatchActionContext> factory(

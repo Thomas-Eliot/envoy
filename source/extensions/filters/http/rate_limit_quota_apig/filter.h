@@ -490,6 +490,14 @@ public:
         token_usage_accumulator_(config_->extractAgentTokenUsage()) {}
 
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap&, bool end_stream) override;
+  // Hold the request body/trailers while a synchronous quota check started in
+  // decodeHeaders is still pending. decodeHeaders returns StopIteration, which
+  // only pauses HEADER iteration; without these overrides the inherited
+  // PassThroughFilter would Continue on body/trailers and ship the request
+  // upstream before the allow/deny verdict is known, so over-quota requests
+  // would never be blocked.
+  Http::FilterDataStatus decodeData(Buffer::Instance&, bool end_stream) override;
+  Http::FilterTrailersStatus decodeTrailers(Http::RequestTrailerMap&) override;
   Http::FilterHeadersStatus encodeHeaders(Http::ResponseHeaderMap&, bool end_stream) override;
   Http::FilterDataStatus encodeData(Buffer::Instance&, bool end_stream) override;
   void onDestroy() override;
