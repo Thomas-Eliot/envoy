@@ -209,11 +209,18 @@ public:
     // Create pending check entry
     auto pending = std::make_unique<PendingQuotaCheck>(&callbacks);
 
-    // Create timeout timer for this specific request
+    // Create timeout timer for this specific request.
+    // Clamp to at least 1ms: a zero timeout (proto default when the field is
+    // explicitly set but left empty) would fire in the very next event-loop
+    // iteration, failing the check before any server response can arrive.
+    const auto effective_timeout =
+        (timeout.count() > 0) ? timeout : std::chrono::milliseconds{100};
+    ENVOY_LOG(debug, "checkQuotaAsync: timeout={}ms (requested={}ms)",
+              effective_timeout.count(), timeout.count());
     pending->timeout_timer = dispatcher_.createTimer([this, cb = &callbacks]() {
       onCheckTimeout(cb);
     });
-    pending->timeout_timer->enableTimer(timeout);
+    pending->timeout_timer->enableTimer(effective_timeout);
 
     // Build the sync check request
     RateLimitQuotaUsageReports request;

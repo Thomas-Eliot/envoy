@@ -106,10 +106,18 @@ std::chrono::milliseconds coldPathTimeoutValue(
     const envoy::extensions::filters::http::rate_limit_quota_apig::v3::RateLimitQuotaFilterConfig&
         cfg) {
   if (cfg.has_cold_hot_config() && cfg.cold_hot_config().has_cold_sync_timeout()) {
-    return durationToMs(cfg.cold_hot_config().cold_sync_timeout());
+    const auto ms = durationToMs(cfg.cold_hot_config().cold_sync_timeout());
+    // A zero Duration means the field was explicitly set but left at protobuf default.
+    // Fall through to kDefaultSyncCheckTimeout rather than firing timers instantly.
+    if (ms.count() > 0) {
+      return ms;
+    }
   }
   if (cfg.has_degradation_mode_config() && cfg.degradation_mode_config().has_sync_check_timeout()) {
-    return durationToMs(cfg.degradation_mode_config().sync_check_timeout());
+    const auto ms = durationToMs(cfg.degradation_mode_config().sync_check_timeout());
+    if (ms.count() > 0) {
+      return ms;
+    }
   }
   return kDefaultSyncCheckTimeout;
 }
@@ -118,7 +126,10 @@ std::chrono::milliseconds degradationSyncTimeoutValue(
     const envoy::extensions::filters::http::rate_limit_quota_apig::v3::RateLimitQuotaFilterConfig&
         cfg) {
   if (cfg.has_degradation_mode_config() && cfg.degradation_mode_config().has_sync_check_timeout()) {
-    return durationToMs(cfg.degradation_mode_config().sync_check_timeout());
+    const auto ms = durationToMs(cfg.degradation_mode_config().sync_check_timeout());
+    if (ms.count() > 0) {
+      return ms;
+    }
   }
   return kDefaultSyncCheckTimeout;
 }
