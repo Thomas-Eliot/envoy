@@ -217,7 +217,13 @@ public:
         (timeout.count() > 0) ? timeout : std::chrono::milliseconds{100};
     ENVOY_LOG(debug, "checkQuotaAsync: timeout={}ms (requested={}ms)",
               effective_timeout.count(), timeout.count());
-    pending->timeout_timer = dispatcher_.createTimer([this, cb = &callbacks]() {
+    const auto arm_time = dispatcher_.timeSource().monotonicTime();
+    const auto intended_ms = effective_timeout.count();
+    pending->timeout_timer = dispatcher_.createTimer([this, cb = &callbacks, arm_time, intended_ms]() {
+      const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  dispatcher_.timeSource().monotonicTime() - arm_time).count();
+      ENVOY_LOG(warn, "SyncQuotaChecker: timer callback fired cb={} elapsed={}us intended={}ms",
+                static_cast<const void*>(cb), elapsed_us, intended_ms);
       onCheckTimeout(cb);
     });
     pending->timeout_timer->enableTimer(effective_timeout);
