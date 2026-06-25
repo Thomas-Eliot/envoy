@@ -157,6 +157,12 @@ func getRequest(r *C.httpRequest) *httpRequest {
 func getState(s *C.processState) *processState {
 	r := s.req
 	req := getRequest(r)
+	if req == nil {
+		// The request has not been created yet (e.g. an early sendLocalReply reaches
+		// the encode path before headers were handled) or has already been destroyed.
+		// Returning nil lets the caller skip processing instead of dereferencing nil.
+		return nil
+	}
 	if s.is_encoding == 0 {
 		return &req.decodingState
 	}
@@ -237,6 +243,12 @@ func envoyGoFilterOnHttpHeader(s *C.processState, endStream, headerNum, headerBy
 //export envoyGoFilterOnHttpData
 func envoyGoFilterOnHttpData(s *C.processState, endStream, buffer, length uint64) uint64 {
 	state := getState(s)
+	if state == nil {
+		// No Go filter instance exists for this stream (uninitialized or already
+		// destroyed). There is nothing for the Go side to do, so let Envoy continue
+		// the data iteration unmodified instead of crashing on a nil request.
+		return uint64(api.Continue)
+	}
 
 	req := state.request
 	if req.pInfo.paniced {
