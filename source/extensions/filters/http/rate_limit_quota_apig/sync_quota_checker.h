@@ -191,10 +191,12 @@ public:
                 tokens_estimate);
     }
 
-    // Circuit Breaker: check concurrent requests
-    if (pending_checks_.size() >= max_concurrent_checks_) {
+    // Circuit breaker: count only entries that haven't been pre-completed (timed-out /
+    // cancelled entries stay in pending_checks_ until their server response arrives, so
+    // pending_checks_.size() would overcount and block new checks prematurely).
+    if (active_count_ >= max_concurrent_checks_) {
       ENVOY_LOG(warn, "Async quota check circuit breaker open. Active checks: {}, Max: {}",
-                pending_checks_.size(), max_concurrent_checks_);
+                active_count_, max_concurrent_checks_);
       return false;
     }
 
@@ -207,11 +209,24 @@ public:
     // Create pending check entry
     auto pending = std::make_unique<PendingQuotaCheck>(&callbacks);
 
-    // Create timeout timer for this specific request
-    pending->timeout_timer = dispatcher_.createTimer([this, cb = &callbacks]() {
+    // Create timeout timer for this specific request.
+    // Clamp to at least 1ms: a zero timeout (proto default when the field is
+    // explicitly set but left empty) would fire in the very next event-loop
+    // iteration, failing the check before any server response can arrive.
+    const auto effective_timeout =
+        (timeout.count() > 0) ? timeout : std::chrono::milliseconds{100};
+    ENVOY_LOG(debug, "checkQuotaAsync: timeout={}ms (requested={}ms)",
+              effective_timeout.count(), timeout.count());
+    const auto arm_time = dispatcher_.timeSource().monotonicTime();
+    const auto intended_ms = effective_timeout.count();
+    pending->timeout_timer = dispatcher_.createTimer([this, cb = &callbacks, arm_time, intended_ms]() {
+      const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  dispatcher_.timeSource().monotonicTime() - arm_time).count();
+      ENVOY_LOG(warn, "SyncQuotaChecker: timer callback fired cb={} elapsed={}us intended={}ms",
+                static_cast<const void*>(cb), elapsed_us, intended_ms);
       onCheckTimeout(cb);
     });
-    pending->timeout_timer->enableTimer(timeout);
+    pending->timeout_timer->enableTimer(effective_timeout);
 
     // Build the sync check request
     RateLimitQuotaUsageReports request;
@@ -239,27 +254,32 @@ public:
 
     // Add to queue AFTER successful send
     pending_checks_.push_back(std::move(pending));
+    ++active_count_;
 
-    ENVOY_LOG(debug, "Sent async quota check request, queue size: {}", pending_checks_.size());
+    ENVOY_LOG(debug, "Sent async quota check request, active={} queue_size={}", active_count_,
+              pending_checks_.size());
     return true;
   }
 
   void cancelCheck(AsyncQuotaCheckCallbacks& callbacks) override {
-    // Find and remove the pending check for this callback
     for (auto it = pending_checks_.begin(); it != pending_checks_.end(); ++it) {
       if ((*it)->callbacks == &callbacks) {
         if ((*it)->timeout_timer) {
           (*it)->timeout_timer->disableTimer();
           (*it)->timeout_timer.reset();
         }
-        (*it)->completed = true;
+        if (!(*it)->completed) {
+          (*it)->completed = true;
+          --active_count_;
+        }
         (*it)->callbacks = nullptr;
-        ENVOY_LOG(debug, "Cancelled pending quota check, queue size: {}", pending_checks_.size());
+        ENVOY_LOG(debug, "Cancelled pending quota check, active={} queue_size={}", active_count_,
+                  pending_checks_.size());
         break;
       }
     }
-    // Don't erase here to maintain FIFO order for response matching
-    // Cancelled entries will be skipped when processing responses
+    // Don't erase — entry stays in queue to preserve FIFO alignment with server responses.
+    // completeFrontCheck will consume and discard it when the server's reply arrives.
   }
 
   // Grpc::RawAsyncStreamCallbacks
@@ -328,16 +348,18 @@ public:
 private:
   /**
    * Complete the front-most pending check in the queue.
-   * @param allowed Whether the request should be allowed (ignored if is_error is true).
-   * @param is_error Whether this completion is due to an error.
+   *
+   * Strict 1:1 FIFO: each server response consumes exactly one queue entry,
+   * regardless of whether that entry was already completed (timed-out or
+   * cancelled). This preserves the invariant that response[N] always belongs
+   * to the Nth entry in the queue, so no response/request mismatch can occur
+   * even when individual entries have been pre-failed by their timeout timers.
+   *
+   * @param allowed Whether the request should be allowed (unused when is_error or already completed).
+   * @param is_error Whether this completion is due to a local error (stream close, parse failure).
    * @param deny_retry_after_ms Server-provided deny-cache TTL (0 = no caching).
    */
   void completeFrontCheck(bool allowed, bool is_error, uint32_t deny_retry_after_ms = 0) {
-    // Skip already completed/cancelled entries
-    while (!pending_checks_.empty() && pending_checks_.front()->completed) {
-      pending_checks_.pop_front();
-    }
-
     if (pending_checks_.empty()) {
       ENVOY_LOG(warn, "Received response but no pending checks in queue");
       return;
@@ -345,17 +367,16 @@ private:
 
     auto& pending = pending_checks_.front();
 
-    // Disable timeout timer
+    // Disable timeout timer (no-op if already fired or cleared).
     if (pending->timeout_timer) {
       pending->timeout_timer->disableTimer();
       pending->timeout_timer.reset();
     }
 
-    // Invoke callback if not cancelled
     if (pending->callbacks && !pending->completed) {
+      // Normal path: entry is still active, deliver the result.
       pending->completed = true;
-
-      // Measure SyncCheck RTT at the checker level (covers network + server processing).
+      --active_count_;
       const auto rtt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - pending->send_time)
                               .count();
@@ -368,76 +389,48 @@ private:
                   allowed ? "true" : "false", rtt_ms, pending_checks_.size() - 1);
         pending->callbacks->onQuotaCheckComplete(allowed, deny_retry_after_ms);
       }
+    } else {
+      // Entry was already pre-completed (timeout or cancel). This response is
+      // the server's delayed reply for that entry — consume and discard it.
+      // No callback is needed; the caller already received onQuotaCheckError().
+      ENVOY_LOG(debug, "SyncQuotaChecker: discarding response for already-completed entry "
+                       "(timed-out or cancelled), queue_remaining={}",
+                pending_checks_.size() - 1);
     }
 
-    // Remove from queue
     pending_checks_.pop_front();
-
-    ENVOY_LOG(debug, "Completed quota check, remaining queue size: {}", pending_checks_.size());
   }
 
   /**
    * Handle timeout for a specific check.
    *
-   * IMPORTANT: When a request times out, the server may still send a response later.
-   * This would cause response/request mismatch in our FIFO queue. To maintain
-   * correctness, we reset the entire stream when any request times out.
-   * This ensures all subsequent requests get fresh responses.
+   * Only the timed-out entry is failed. The gRPC stream is kept alive so that
+   * all other pending checks can still receive their responses normally.
+   *
+   * When the server eventually sends the response for the timed-out request,
+   * completeFrontCheck will consume it (strict 1:1 FIFO pop) and discard it
+   * without invoking any callback — the timed-out entry is already marked
+   * completed and its callback has been cleared.
+   *
+   * Previous approach (resetStreamAndFailPending) caused a cascade: one
+   * slow/late response would destroy the entire stream and fail-open every
+   * concurrent SyncCheck in the queue, defeating quota enforcement under load.
    */
   void onCheckTimeout(AsyncQuotaCheckCallbacks* callbacks) {
-    ENVOY_LOG(warn, "Async quota check timed out, resetting stream to prevent response mismatch");
-
-    // Find the timed-out check and invoke error callback
-    bool found = false;
     for (auto& pending : pending_checks_) {
       if (pending->callbacks == callbacks && !pending->completed) {
         pending->completed = true;
+        --active_count_;
         pending->timeout_timer.reset();
-        if (pending->callbacks) {
-          pending->callbacks->onQuotaCheckError();
-          pending->callbacks = nullptr;
-        }
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) {
-      // Already completed or cancelled
-      return;
-    }
-
-    // Reset the stream to prevent response/request mismatch.
-    // All pending requests will receive error callbacks.
-    resetStreamAndFailPending();
-  }
-
-  /**
-   * Reset the gRPC stream and fail all remaining pending checks.
-   * This is called when a timeout occurs to prevent response/request mismatch.
-   */
-  void resetStreamAndFailPending() {
-    // Close the stream first
-    if (stream_ != nullptr) {
-      stream_->resetStream();
-      stream_ = nullptr;
-    }
-
-    // Fail all remaining pending checks
-    for (auto& pending : pending_checks_) {
-      if (pending->timeout_timer) {
-        pending->timeout_timer->disableTimer();
-        pending->timeout_timer.reset();
-      }
-      if (pending->callbacks && !pending->completed) {
-        pending->completed = true;
         pending->callbacks->onQuotaCheckError();
         pending->callbacks = nullptr;
+        ENVOY_LOG(warn, "Async quota check timed out. Stream preserved; "
+                        "server response will be discarded. active_remaining={}",
+                  active_count_);
+        return;
       }
     }
-    pending_checks_.clear();
-
-    ENVOY_LOG(debug, "Stream reset and all pending checks failed due to timeout");
+    // Already completed or cancelled — nothing to do.
   }
 
   /**
@@ -454,6 +447,7 @@ private:
       }
     }
     pending_checks_.clear();
+    active_count_ = 0;
 
     if (stream_ != nullptr) {
       stream_->closeStream();
@@ -486,6 +480,10 @@ private:
 
   // FIFO queue of pending checks - responses match requests in order
   std::deque<std::unique_ptr<PendingQuotaCheck>> pending_checks_;
+  // Number of entries in pending_checks_ that are not yet completed (excludes timed-out /
+  // cancelled zombie entries that are waiting for their server response to arrive).
+  // Used by the circuit breaker instead of pending_checks_.size() to avoid counting zombies.
+  uint32_t active_count_{0};
 };
 
 } // namespace RateLimitQuotaApig

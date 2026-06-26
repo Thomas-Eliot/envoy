@@ -528,9 +528,18 @@ void GlobalRateLimitClientImpl::reportQuotaUsage(const BucketId& bucket_id, cons
     const size_t id = hashBucketId(bucket_id);
     BucketsCache& shard = self->mutableShardForBucket(id);
     if (shard.find(id) == shard.end()) {
-      ENVOY_LOG(debug, "Skipping async report for evicted bucket: {}",
-                bucket_id.ShortDebugString());
-      return;
+      // Cold-path buckets are never added to the shard cache, so "not found"
+      // means either evicted (hot→cold race) or simply never cached (cold path).
+      // If there are real tokens to report, send the report anyway so cold-path
+      // token consumption is accounted in Redis. Pure request-count reports
+      // (tokens==0) from evicted buckets are still dropped to avoid stale data.
+      if (tokens == 0 && input == 0 && output == 0 && cached == 0) {
+        ENVOY_LOG(debug, "Skipping async report for evicted bucket (no tokens): {}",
+                  bucket_id.ShortDebugString());
+        return;
+      }
+      ENVOY_LOG(debug, "Cold-path bucket not in shard cache, sending token report: {} total={} in={} out={} cached={}",
+                bucket_id.ShortDebugString(), tokens, input, output, cached);
     }
 
     RateLimitQuotaUsageReports report;
